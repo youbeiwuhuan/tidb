@@ -16,10 +16,12 @@ package distsql
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/errno"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/metrics"
 	"github.com/pingcap/tidb/sessionctx"
@@ -32,6 +34,10 @@ import (
 	"github.com/pingcap/tidb/util/memory"
 	"github.com/pingcap/tipb/go-tipb"
 	"go.uber.org/zap"
+)
+
+var (
+	errQueryInterrupted = terror.ClassExecutor.NewStd(errno.ErrQueryInterrupted)
 )
 
 var (
@@ -60,7 +66,7 @@ type selectResult struct {
 	ctx        sessionctx.Context
 
 	selectResp       *tipb.SelectResponse
-	selectRespSize   int // record the selectResp.Size() when it is initialized.
+	selectRespSize   int64 // record the selectResp.Size() when it is initialized.
 	respChkIdx       int
 	respChunkDecoder *chunk.Decoder
 
@@ -93,15 +99,16 @@ func (r *selectResult) fetchResp(ctx context.Context) error {
 			return errors.Trace(err)
 		}
 		if r.selectResp != nil {
-			r.memConsume(-int64(r.selectRespSize))
+			r.memConsume(-atomic.LoadInt64(&r.selectRespSize))
 		}
 		if resultSubset == nil {
 			r.selectResp = nil
+			atomic.StoreInt64(&r.selectRespSize, 0)
 			if !r.durationReported {
 				// final round of fetch
 				// TODO: Add a label to distinguish between success or failure.
 				// https://github.com/pingcap/tidb/issues/11397
-				metrics.DistSQLQueryHistgram.WithLabelValues(r.label, r.sqlType).Observe(r.fetchDuration.Seconds())
+				metrics.DistSQLQueryHistogram.WithLabelValues(r.label, r.sqlType).Observe(r.fetchDuration.Seconds())
 				r.durationReported = true
 			}
 			return nil
@@ -111,19 +118,28 @@ func (r *selectResult) fetchResp(ctx context.Context) error {
 		if err != nil {
 			return errors.Trace(err)
 		}
-		r.selectRespSize = r.selectResp.Size()
-		r.memConsume(int64(r.selectRespSize))
+		respSize := int64(r.selectResp.Size())
+		atomic.StoreInt64(&r.selectRespSize, respSize)
+		r.memConsume(respSize)
 		if err := r.selectResp.Error; err != nil {
-			return terror.ClassTiKV.New(terror.ErrCode(err.Code), err.Msg)
+			return terror.ClassTiKV.Synthesize(terror.ErrCode(err.Code), err.Msg)
 		}
-		sc := r.ctx.GetSessionVars().StmtCtx
+		sessVars := r.ctx.GetSessionVars()
+		if atomic.LoadUint32(&sessVars.Killed) == 1 {
+			return errors.Trace(errQueryInterrupted)
+		}
+		sc := sessVars.StmtCtx
 		for _, warning := range r.selectResp.Warnings {
-			sc.AppendWarning(terror.ClassTiKV.New(terror.ErrCode(warning.Code), warning.Msg))
+			sc.AppendWarning(terror.ClassTiKV.Synthesize(terror.ErrCode(warning.Code), warning.Msg))
 		}
-		r.updateCopRuntimeStats(resultSubset.GetExecDetails(), resultSubset.RespTime())
+		resultDetail := resultSubset.GetExecDetails()
+		r.updateCopRuntimeStats(ctx, resultDetail, resultSubset.RespTime())
 		r.feedback.Update(resultSubset.GetStartKey(), r.selectResp.OutputCounts)
 		r.partialCount++
-		sc.MergeExecDetails(resultSubset.GetExecDetails(), nil)
+		if resultDetail != nil {
+			resultDetail.CopTime = duration
+		}
+		sc.MergeExecDetails(resultDetail, nil)
 		if len(r.selectResp.Chunks) != 0 {
 			break
 		}
@@ -219,13 +235,13 @@ func (r *selectResult) readFromChunk(ctx context.Context, chk *chunk.Chunk) erro
 	return nil
 }
 
-func (r *selectResult) updateCopRuntimeStats(detail *execdetails.ExecDetails, respTime time.Duration) {
+func (r *selectResult) updateCopRuntimeStats(ctx context.Context, detail *execdetails.ExecDetails, respTime time.Duration) {
 	callee := detail.CalleeAddress
-	if r.ctx.GetSessionVars().StmtCtx.RuntimeStatsColl == nil || callee == "" {
+	if r.rootPlanID == nil || r.ctx.GetSessionVars().StmtCtx.RuntimeStatsColl == nil || callee == "" {
 		return
 	}
 	if len(r.selectResp.GetExecutionSummaries()) != len(r.copPlanIDs) {
-		logutil.BgLogger().Error("invalid cop task execution summaries length",
+		logutil.Logger(ctx).Error("invalid cop task execution summaries length",
 			zap.Int("expected", len(r.copPlanIDs)),
 			zap.Int("received", len(r.selectResp.GetExecutionSummaries())))
 
@@ -236,9 +252,14 @@ func (r *selectResult) updateCopRuntimeStats(detail *execdetails.ExecDetails, re
 	for i, detail := range r.selectResp.GetExecutionSummaries() {
 		if detail != nil && detail.TimeProcessedNs != nil &&
 			detail.NumProducedRows != nil && detail.NumIterations != nil {
-			planID := r.copPlanIDs[i]
+			planID := ""
+			if detail.GetExecutorId() != "" {
+				planID = detail.GetExecutorId()
+			} else {
+				planID = r.copPlanIDs[i].String()
+			}
 			r.ctx.GetSessionVars().StmtCtx.RuntimeStatsColl.
-				RecordOneCopTask(planID.String(), callee, detail)
+				RecordOneCopTask(planID, callee, detail)
 		}
 	}
 }
@@ -270,8 +291,9 @@ func (r *selectResult) Close() error {
 		metrics.DistSQLScanKeysHistogram.Observe(float64(r.feedback.Actual()))
 	}
 	metrics.DistSQLPartialCountHistogram.Observe(float64(r.partialCount))
-	if r.selectResp != nil {
-		r.memConsume(-int64(r.selectRespSize))
+	respSize := atomic.SwapInt64(&r.selectRespSize, 0)
+	if respSize > 0 {
+		r.memConsume(-respSize)
 	}
 	return r.resp.Close()
 }

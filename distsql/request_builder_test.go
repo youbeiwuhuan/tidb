@@ -19,6 +19,7 @@ import (
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
@@ -56,7 +57,7 @@ type testSuite struct {
 func (s *testSuite) SetUpSuite(c *C) {
 	ctx := mock.NewContext()
 	ctx.GetSessionVars().StmtCtx = &stmtctx.StatementContext{
-		MemTracker:  memory.NewTracker(stringutil.StringerStr("testSuite"), variable.DefTiDBMemQuotaDistSQL),
+		MemTracker:  memory.NewTracker(stringutil.StringerStr("testSuite"), -1),
 		DiskTracker: disk.NewTracker(stringutil.StringerStr("testSuite"), -1),
 	}
 	ctx.Store = &mock.Store{
@@ -101,7 +102,7 @@ func (s *testSuite) getExpectedRanges(tid int64, hrs []*handleRange) []kv.KeyRan
 	for _, hr := range hrs {
 		low := codec.EncodeInt(nil, hr.start)
 		high := codec.EncodeInt(nil, hr.end)
-		high = []byte(kv.Key(high).PrefixNext())
+		high = kv.Key(high).PrefixNext()
 		startKey := tablecodec.EncodeRowKey(tid, low)
 		endKey := tablecodec.EncodeRowKey(tid, high)
 		krs = append(krs, kv.KeyRange{StartKey: startKey, EndKey: endKey})
@@ -110,7 +111,8 @@ func (s *testSuite) getExpectedRanges(tid int64, hrs []*handleRange) []kv.KeyRan
 }
 
 func (s *testSuite) TestTableHandlesToKVRanges(c *C) {
-	handles := []int64{0, 2, 3, 4, 5, 10, 11, 100, 9223372036854775806, 9223372036854775807}
+	handles := []kv.Handle{kv.IntHandle(0), kv.IntHandle(2), kv.IntHandle(3), kv.IntHandle(4), kv.IntHandle(5),
+		kv.IntHandle(10), kv.IntHandle(11), kv.IntHandle(100), kv.IntHandle(9223372036854775806), kv.IntHandle(9223372036854775807)}
 
 	// Build expected key ranges.
 	hrs := make([]*handleRange, 0, len(handles))
@@ -313,7 +315,7 @@ func (s *testSuite) TestRequestBuilder1(c *C) {
 		Cacheable:      true,
 		KeepOrder:      false,
 		Desc:           false,
-		Concurrency:    15,
+		Concurrency:    variable.DefDistSQLScanConcurrency,
 		IsolationLevel: 0,
 		Priority:       0,
 		NotFillCache:   false,
@@ -389,7 +391,7 @@ func (s *testSuite) TestRequestBuilder2(c *C) {
 		Cacheable:      true,
 		KeepOrder:      false,
 		Desc:           false,
-		Concurrency:    15,
+		Concurrency:    variable.DefDistSQLScanConcurrency,
 		IsolationLevel: 0,
 		Priority:       0,
 		NotFillCache:   false,
@@ -401,7 +403,8 @@ func (s *testSuite) TestRequestBuilder2(c *C) {
 }
 
 func (s *testSuite) TestRequestBuilder3(c *C) {
-	handles := []int64{0, 2, 3, 4, 5, 10, 11, 100}
+	handles := []kv.Handle{kv.IntHandle(0), kv.IntHandle(2), kv.IntHandle(3), kv.IntHandle(4),
+		kv.IntHandle(5), kv.IntHandle(10), kv.IntHandle(11), kv.IntHandle(100)}
 
 	actual, err := (&RequestBuilder{}).SetTableHandles(15, handles).
 		SetDAGRequest(&tipb.DAGRequest{}).
@@ -435,7 +438,7 @@ func (s *testSuite) TestRequestBuilder3(c *C) {
 		Cacheable:      true,
 		KeepOrder:      false,
 		Desc:           false,
-		Concurrency:    15,
+		Concurrency:    variable.DefDistSQLScanConcurrency,
 		IsolationLevel: 0,
 		Priority:       0,
 		NotFillCache:   false,
@@ -482,7 +485,7 @@ func (s *testSuite) TestRequestBuilder4(c *C) {
 		Cacheable:      true,
 		KeepOrder:      false,
 		Desc:           false,
-		Concurrency:    15,
+		Concurrency:    variable.DefDistSQLScanConcurrency,
 		IsolationLevel: 0,
 		Priority:       0,
 		Streaming:      true,
@@ -596,6 +599,27 @@ func (s *testSuite) TestRequestBuilder7(c *C) {
 		ReplicaRead:    kv.ReplicaReadFollower,
 	}
 
+	c.Assert(actual, DeepEquals, expect)
+}
+
+func (s *testSuite) TestRequestBuilder8(c *C) {
+	sv := variable.NewSessionVars()
+	sv.SnapshotInfoschema = infoschema.MockInfoSchemaWithSchemaVer(nil, 10000)
+	actual, err := (&RequestBuilder{}).
+		SetFromSessionVars(sv).
+		Build()
+	c.Assert(err, IsNil)
+	expect := &kv.Request{
+		Tp:             0,
+		StartTs:        0x0,
+		Data:           []uint8(nil),
+		Concurrency:    variable.DefDistSQLScanConcurrency,
+		IsolationLevel: 0,
+		Priority:       0,
+		MemTracker:     (*memory.Tracker)(nil),
+		ReplicaRead:    0x1,
+		SchemaVar:      10000,
+	}
 	c.Assert(actual, DeepEquals, expect)
 }
 

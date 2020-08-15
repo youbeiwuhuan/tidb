@@ -22,8 +22,8 @@ import (
 
 	"github.com/opentracing/opentracing-go"
 	"github.com/pingcap/parser/model"
-	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/parser/terror"
+	mysql "github.com/pingcap/tidb/errno"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta/autoid"
 	"github.com/pingcap/tidb/sessionctx"
@@ -66,8 +66,9 @@ const (
 
 var (
 	// ErrColumnCantNull is used for inserting null to a not null column.
-	ErrColumnCantNull  = terror.ClassTable.New(mysql.ErrBadNull, mysql.MySQLErrName[mysql.ErrBadNull])
-	errUnknownColumn   = terror.ClassTable.New(mysql.ErrBadField, mysql.MySQLErrName[mysql.ErrBadField])
+	ErrColumnCantNull = terror.ClassTable.New(mysql.ErrBadNull, mysql.MySQLErrName[mysql.ErrBadNull])
+	// ErrUnknownColumn is returned when accessing an unknown column.
+	ErrUnknownColumn   = terror.ClassTable.New(mysql.ErrBadField, mysql.MySQLErrName[mysql.ErrBadField])
 	errDuplicateColumn = terror.ClassTable.New(mysql.ErrFieldSpecifiedTwice, mysql.MySQLErrName[mysql.ErrFieldSpecifiedTwice])
 
 	errGetDefaultFailed = terror.ClassTable.New(mysql.ErrFieldGetDefaultFailed, mysql.MySQLErrName[mysql.ErrFieldGetDefaultFailed])
@@ -99,20 +100,33 @@ var (
 	ErrNoPartitionForGivenValue = terror.ClassTable.New(mysql.ErrNoPartitionForGivenValue, mysql.MySQLErrName[mysql.ErrNoPartitionForGivenValue])
 	// ErrLockOrActiveTransaction returns when execute unsupported statement in a lock session or an active transaction.
 	ErrLockOrActiveTransaction = terror.ClassTable.New(mysql.ErrLockOrActiveTransaction, mysql.MySQLErrName[mysql.ErrLockOrActiveTransaction])
+	// ErrSequenceHasRunOut returns when sequence has run out.
+	ErrSequenceHasRunOut = terror.ClassTable.New(mysql.ErrSequenceRunOut, mysql.MySQLErrName[mysql.ErrSequenceRunOut])
+	// ErrRowDoesNotMatchGivenPartitionSet returns when the destination partition conflict with the partition selection.
+	ErrRowDoesNotMatchGivenPartitionSet = terror.ClassTable.NewStd(mysql.ErrRowDoesNotMatchGivenPartitionSet)
 )
 
 // RecordIterFunc is used for low-level record iteration.
-type RecordIterFunc func(h int64, rec []types.Datum, cols []*Column) (more bool, err error)
+type RecordIterFunc func(h kv.Handle, rec []types.Datum, cols []*Column) (more bool, err error)
 
 // AddRecordOpt contains the options will be used when adding a record.
 type AddRecordOpt struct {
 	CreateIdxOpt
-	IsUpdate bool
+	IsUpdate      bool
+	ReserveAutoID int
 }
 
 // AddRecordOption is defined for the AddRecord() method of the Table interface.
 type AddRecordOption interface {
 	ApplyOn(*AddRecordOpt)
+}
+
+// WithReserveAutoIDHint tells the AddRecord operation to reserve a batch of auto ID in the stmtctx.
+type WithReserveAutoIDHint int
+
+// ApplyOn implements the AddRecordOption interface.
+func (n WithReserveAutoIDHint) ApplyOn(opt *AddRecordOpt) {
+	opt.ReserveAutoID = int(n)
 }
 
 // ApplyOn implements the AddRecordOption interface, so any CreateIdxOptFunc
@@ -136,10 +150,10 @@ type Table interface {
 	IterRecords(ctx sessionctx.Context, startKey kv.Key, cols []*Column, fn RecordIterFunc) error
 
 	// RowWithCols returns a row that contains the given cols.
-	RowWithCols(ctx sessionctx.Context, h int64, cols []*Column) ([]types.Datum, error)
+	RowWithCols(ctx sessionctx.Context, h kv.Handle, cols []*Column) ([]types.Datum, error)
 
 	// Row returns a row for all columns.
-	Row(ctx sessionctx.Context, h int64) ([]types.Datum, error)
+	Row(ctx sessionctx.Context, h kv.Handle) ([]types.Datum, error)
 
 	// Cols returns the columns of the table which is used in select, including hidden columns.
 	Cols() []*Column
@@ -153,6 +167,9 @@ type Table interface {
 	// WritableCols returns columns of the table in writable states.
 	// Writable states includes Public, WriteOnly, WriteOnlyReorganization.
 	WritableCols() []*Column
+
+	// FullHiddenColsAndVisibleCols returns hidden columns in all states and unhidden columns in public states.
+	FullHiddenColsAndVisibleCols() []*Column
 
 	// Indices returns the indices of the table.
 	Indices() []Index
@@ -173,39 +190,30 @@ type Table interface {
 	FirstKey() kv.Key
 
 	// RecordKey returns the key in KV storage for the row.
-	RecordKey(h int64) kv.Key
+	RecordKey(h kv.Handle) kv.Key
 
 	// AddRecord inserts a row which should contain only public columns
-	AddRecord(ctx sessionctx.Context, r []types.Datum, opts ...AddRecordOption) (recordID int64, err error)
+	AddRecord(ctx sessionctx.Context, r []types.Datum, opts ...AddRecordOption) (recordID kv.Handle, err error)
 
 	// UpdateRecord updates a row which should contain only writable columns.
-	UpdateRecord(ctx sessionctx.Context, h int64, currData, newData []types.Datum, touched []bool) error
+	UpdateRecord(ctx context.Context, sctx sessionctx.Context, h kv.Handle, currData, newData []types.Datum, touched []bool) error
 
 	// RemoveRecord removes a row in the table.
-	RemoveRecord(ctx sessionctx.Context, h int64, r []types.Datum) error
+	RemoveRecord(ctx sessionctx.Context, h kv.Handle, r []types.Datum) error
 
-	// AllocHandle allocates a handle for a new row.
-	AllocHandle(ctx sessionctx.Context) (int64, error)
-
-	// AllocHandleIDs allocates multiple handle for rows.
-	AllocHandleIDs(ctx sessionctx.Context, n uint64) (int64, int64, error)
-
-	// Allocator returns Allocator.
-	Allocator(ctx sessionctx.Context, allocatorType autoid.AllocatorType) autoid.Allocator
-
-	// AllAllocators returns all allocators.
-	AllAllocators(ctx sessionctx.Context) autoid.Allocators
+	// Allocators returns all allocators.
+	Allocators(ctx sessionctx.Context) autoid.Allocators
 
 	// RebaseAutoID rebases the auto_increment ID base.
 	// If allocIDs is true, it will allocate some IDs and save to the cache.
 	// If allocIDs is false, it will not allocate IDs.
-	RebaseAutoID(ctx sessionctx.Context, newBase int64, allocIDs bool) error
+	RebaseAutoID(ctx sessionctx.Context, newBase int64, allocIDs bool, tp autoid.AllocatorType) error
 
 	// Meta returns TableInfo.
 	Meta() *model.TableInfo
 
 	// Seek returns the handle greater or equal to h.
-	Seek(ctx sessionctx.Context, h int64) (handle int64, found bool, err error)
+	Seek(ctx sessionctx.Context, h kv.Handle) (handle kv.Handle, found bool, err error)
 
 	// Type returns the type of table
 	Type() Type
@@ -219,7 +227,7 @@ func AllocAutoIncrementValue(ctx context.Context, t Table, sctx sessionctx.Conte
 	}
 	increment := sctx.GetSessionVars().AutoIncrementIncrement
 	offset := sctx.GetSessionVars().AutoIncrementOffset
-	_, max, err := t.Allocator(sctx, autoid.RowIDAllocType).Alloc(t.Meta().ID, uint64(1), int64(increment), int64(offset))
+	_, max, err := t.Allocators(sctx).Get(autoid.RowIDAllocType).Alloc(t.Meta().ID, uint64(1), int64(increment), int64(offset))
 	if err != nil {
 		return 0, err
 	}
@@ -235,7 +243,7 @@ func AllocBatchAutoIncrementValue(ctx context.Context, t Table, sctx sessionctx.
 	}
 	increment = int64(sctx.GetSessionVars().AutoIncrementIncrement)
 	offset := int64(sctx.GetSessionVars().AutoIncrementOffset)
-	min, max, err := t.Allocator(sctx, autoid.RowIDAllocType).Alloc(t.Meta().ID, uint64(N), increment, offset)
+	min, max, err := t.Allocators(sctx).Get(autoid.RowIDAllocType).Alloc(t.Meta().ID, uint64(N), increment, offset)
 	if err != nil {
 		return min, max, err
 	}
@@ -258,7 +266,7 @@ type PhysicalTable interface {
 type PartitionedTable interface {
 	Table
 	GetPartition(physicalID int64) PhysicalTable
-	GetPartitionByRow(sessionctx.Context, []types.Datum) (Table, error)
+	GetPartitionByRow(sessionctx.Context, []types.Datum) (PhysicalTable, error)
 }
 
 // TableFromMeta builds a table.Table from *model.TableInfo.
@@ -267,37 +275,3 @@ var TableFromMeta func(allocators autoid.Allocators, tblInfo *model.TableInfo) (
 
 // MockTableFromMeta only serves for test.
 var MockTableFromMeta func(tableInfo *model.TableInfo) Table
-
-// Slice is used for table sorting.
-type Slice []Table
-
-func (s Slice) Len() int { return len(s) }
-
-func (s Slice) Less(i, j int) bool {
-	return s[i].Meta().Name.O < s[j].Meta().Name.O
-}
-
-func (s Slice) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
-
-func init() {
-	tableMySQLErrCodes := map[terror.ErrCode]uint16{
-		mysql.ErrBadNull:                     mysql.ErrBadNull,
-		mysql.ErrBadField:                    mysql.ErrBadField,
-		mysql.ErrFieldSpecifiedTwice:         mysql.ErrFieldSpecifiedTwice,
-		mysql.ErrNoDefaultForField:           mysql.ErrNoDefaultForField,
-		mysql.ErrTruncatedWrongValueForField: mysql.ErrTruncatedWrongValueForField,
-		mysql.ErrUnknownPartition:            mysql.ErrUnknownPartition,
-		mysql.ErrNoPartitionForGivenValue:    mysql.ErrNoPartitionForGivenValue,
-		mysql.ErrLockOrActiveTransaction:     mysql.ErrLockOrActiveTransaction,
-		mysql.ErrIndexOutBound:               mysql.ErrIndexOutBound,
-		mysql.ErrColumnStateNonPublic:        mysql.ErrColumnStateNonPublic,
-		mysql.ErrFieldGetDefaultFailed:       mysql.ErrFieldGetDefaultFailed,
-		mysql.ErrUnsupportedOp:               mysql.ErrUnsupportedOp,
-		mysql.ErrRowNotFound:                 mysql.ErrRowNotFound,
-		mysql.ErrTableStateCantNone:          mysql.ErrTableStateCantNone,
-		mysql.ErrColumnStateCantNone:         mysql.ErrColumnStateCantNone,
-		mysql.ErrIndexStateCantNone:          mysql.ErrIndexStateCantNone,
-		mysql.ErrInvalidRecordKey:            mysql.ErrInvalidRecordKey,
-	}
-	terror.ErrClassToMySQLCodes[terror.ClassTable] = tableMySQLErrCodes
-}

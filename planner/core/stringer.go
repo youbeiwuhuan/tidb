@@ -17,6 +17,8 @@ import (
 	"bytes"
 	"fmt"
 	"strings"
+
+	"github.com/pingcap/tidb/util/plancodec"
 )
 
 // ToString explains a Plan, returns description string.
@@ -131,12 +133,16 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 			r := eq.GetArgs()[1].String()
 			str += fmt.Sprintf("(%s,%s)", l, r)
 		}
-	case *LogicalUnionAll, *PhysicalUnionAll:
+	case *LogicalUnionAll, *PhysicalUnionAll, *LogicalPartitionUnionAll:
 		last := len(idxs) - 1
 		idx := idxs[last]
 		children := strs[idx:]
 		strs = strs[:idx]
-		str = "UnionAll{" + strings.Join(children, "->") + "}"
+		name := "UnionAll"
+		if x.TP() == plancodec.TypePartitionUnion {
+			name = "PartitionUnionAll"
+		}
+		str = name + "{" + strings.Join(children, "->") + "}"
 		idxs = idxs[:last]
 	case *DataSource:
 		if x.isPartition {
@@ -234,8 +240,8 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 		}
 		for _, col := range x.ColTasks {
 			var colNames []string
-			if col.PKInfo != nil {
-				colNames = append(colNames, col.PKInfo.Name.O)
+			if col.HandleCols != nil {
+				colNames = append(colNames, col.HandleCols.String())
 			}
 			for _, c := range col.ColsInfo {
 				colNames = append(colNames, c.Name.O)
@@ -258,6 +264,24 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 		str = fmt.Sprintf("Window(%s)", buffer.String())
 	case *PhysicalWindow:
 		str = fmt.Sprintf("Window(%s)", x.ExplainInfo())
+	case *PhysicalShuffle:
+		str = fmt.Sprintf("Partition(%s)", x.ExplainInfo())
+	case *PhysicalShuffleDataSourceStub:
+		str = fmt.Sprintf("PartitionDataSourceStub(%s)", x.ExplainInfo())
+	case *PointGetPlan:
+		str = fmt.Sprintf("PointGet(")
+		if x.IndexInfo != nil {
+			str += fmt.Sprintf("Index(%s.%s)%v)", x.TblInfo.Name.L, x.IndexInfo.Name.L, x.IndexValues)
+		} else {
+			str += fmt.Sprintf("Handle(%s.%s)%v)", x.TblInfo.Name.L, x.TblInfo.GetPkName().L, x.Handle)
+		}
+	case *BatchPointGetPlan:
+		str = fmt.Sprintf("BatchPointGet(")
+		if x.IndexInfo != nil {
+			str += fmt.Sprintf("Index(%s.%s)%v)", x.TblInfo.Name.L, x.IndexInfo.Name.L, x.IndexValues)
+		} else {
+			str += fmt.Sprintf("Handle(%s.%s)%v)", x.TblInfo.Name.L, x.TblInfo.GetPkName().L, x.Handles)
+		}
 	default:
 		str = fmt.Sprintf("%T", in)
 	}

@@ -197,7 +197,7 @@ func (s *testTypeConvertSuite) TestConvertType(c *C) {
 	c.Assert(v, Equals, uint64(100))
 	// issue 3470
 	ft = NewFieldType(mysql.TypeLonglong)
-	v, err = Convert(Duration{Duration: time.Duration(12*time.Hour + 59*time.Minute + 59*time.Second + 555*time.Millisecond), Fsp: 3}, ft)
+	v, err = Convert(Duration{Duration: 12*time.Hour + 59*time.Minute + 59*time.Second + 555*time.Millisecond, Fsp: 3}, ft)
 	c.Assert(err, IsNil)
 	c.Assert(v, Equals, int64(130000))
 	v, err = Convert(NewTime(FromDate(2017, 1, 1, 12, 59, 59, 555000), mysql.TypeDatetime, MaxFsp), ft)
@@ -317,7 +317,7 @@ func (s *testTypeConvertSuite) TestConvertToString(c *C) {
 	testToString(c, "0", "0")
 	testToString(c, true, "1")
 	testToString(c, "false", "false")
-	testToString(c, int(0), "0")
+	testToString(c, 0, "0")
 	testToString(c, int64(0), "0")
 	testToString(c, uint64(0), "0")
 	testToString(c, float32(1.6), "1.6")
@@ -381,7 +381,7 @@ func (s *testTypeConvertSuite) TestConvertToString(c *C) {
 func testStrToInt(c *C, str string, expect int64, truncateAsErr bool, expectErr error) {
 	sc := new(stmtctx.StatementContext)
 	sc.IgnoreTruncate = !truncateAsErr
-	val, err := StrToInt(sc, str)
+	val, err := StrToInt(sc, str, false)
 	if expectErr != nil {
 		c.Assert(terror.ErrorEqual(err, expectErr), IsTrue, Commentf("err %v", err))
 	} else {
@@ -393,7 +393,7 @@ func testStrToInt(c *C, str string, expect int64, truncateAsErr bool, expectErr 
 func testStrToUint(c *C, str string, expect uint64, truncateAsErr bool, expectErr error) {
 	sc := new(stmtctx.StatementContext)
 	sc.IgnoreTruncate = !truncateAsErr
-	val, err := StrToUint(sc, str)
+	val, err := StrToUint(sc, str, false)
 	if expectErr != nil {
 		c.Assert(terror.ErrorEqual(err, expectErr), IsTrue, Commentf("err %v", err))
 	} else {
@@ -405,7 +405,7 @@ func testStrToUint(c *C, str string, expect uint64, truncateAsErr bool, expectEr
 func testStrToFloat(c *C, str string, expect float64, truncateAsErr bool, expectErr error) {
 	sc := new(stmtctx.StatementContext)
 	sc.IgnoreTruncate = !truncateAsErr
-	val, err := StrToFloat(sc, str)
+	val, err := StrToFloat(sc, str, false)
 	if expectErr != nil {
 		c.Assert(terror.ErrorEqual(err, expectErr), IsTrue, Commentf("err %v", err))
 	} else {
@@ -479,15 +479,15 @@ func testSelectUpdateDeleteEmptyStringError(c *C) {
 		str := ""
 		expect := 0
 
-		val, err := StrToInt(sc, str)
+		val, err := StrToInt(sc, str, false)
 		c.Assert(err, IsNil)
 		c.Assert(val, Equals, int64(expect))
 
-		val1, err := StrToUint(sc, str)
+		val1, err := StrToUint(sc, str, false)
 		c.Assert(err, IsNil)
 		c.Assert(val1, Equals, uint64(expect))
 
-		val2, err := StrToFloat(sc, str)
+		val2, err := StrToFloat(sc, str, false)
 		c.Assert(err, IsNil)
 		c.Assert(val2, Equals, float64(expect))
 	}
@@ -568,28 +568,43 @@ func (s *testTypeConvertSuite) TestConvert(c *C) {
 	signedAccept(c, mysql.TypeTiny, -128, "-128")
 	signedAccept(c, mysql.TypeTiny, 127, "127")
 	signedDeny(c, mysql.TypeTiny, 128, "127")
+	signedAccept(c, mysql.TypeTiny, NewBinaryLiteralFromUint(127, -1), "127")
+	signedDeny(c, mysql.TypeTiny, NewBinaryLiteralFromUint(128, -1), "127")
 	unsignedDeny(c, mysql.TypeTiny, -1, "255")
 	unsignedAccept(c, mysql.TypeTiny, 0, "0")
 	unsignedAccept(c, mysql.TypeTiny, 255, "255")
 	unsignedDeny(c, mysql.TypeTiny, 256, "255")
+	unsignedAccept(c, mysql.TypeTiny, NewBinaryLiteralFromUint(0, -1), "0")
+	unsignedAccept(c, mysql.TypeTiny, NewBinaryLiteralFromUint(255, -1), "255")
+	unsignedDeny(c, mysql.TypeTiny, NewBinaryLiteralFromUint(256, -1), "255")
 
 	signedDeny(c, mysql.TypeShort, int64(math.MinInt16)-1, strvalue(int64(math.MinInt16)))
 	signedAccept(c, mysql.TypeShort, int64(math.MinInt16), strvalue(int64(math.MinInt16)))
 	signedAccept(c, mysql.TypeShort, int64(math.MaxInt16), strvalue(int64(math.MaxInt16)))
 	signedDeny(c, mysql.TypeShort, int64(math.MaxInt16)+1, strvalue(int64(math.MaxInt16)))
+	signedAccept(c, mysql.TypeShort, NewBinaryLiteralFromUint(math.MaxInt16, -1), strvalue(int64(math.MaxInt16)))
+	signedDeny(c, mysql.TypeShort, NewBinaryLiteralFromUint(math.MaxInt16+1, -1), strvalue(int64(math.MaxInt16)))
 	unsignedDeny(c, mysql.TypeShort, -1, "65535")
 	unsignedAccept(c, mysql.TypeShort, 0, "0")
 	unsignedAccept(c, mysql.TypeShort, uint64(math.MaxUint16), strvalue(uint64(math.MaxUint16)))
 	unsignedDeny(c, mysql.TypeShort, uint64(math.MaxUint16)+1, strvalue(uint64(math.MaxUint16)))
+	unsignedAccept(c, mysql.TypeShort, NewBinaryLiteralFromUint(0, -1), "0")
+	unsignedAccept(c, mysql.TypeShort, NewBinaryLiteralFromUint(math.MaxUint16, -1), strvalue(uint64(math.MaxUint16)))
+	unsignedDeny(c, mysql.TypeShort, NewBinaryLiteralFromUint(math.MaxUint16+1, -1), strvalue(uint64(math.MaxUint16)))
 
 	signedDeny(c, mysql.TypeInt24, -1<<23-1, strvalue(-1<<23))
 	signedAccept(c, mysql.TypeInt24, -1<<23, strvalue(-1<<23))
 	signedAccept(c, mysql.TypeInt24, 1<<23-1, strvalue(1<<23-1))
 	signedDeny(c, mysql.TypeInt24, 1<<23, strvalue(1<<23-1))
+	signedAccept(c, mysql.TypeInt24, NewBinaryLiteralFromUint(1<<23-1, -1), strvalue(1<<23-1))
+	signedDeny(c, mysql.TypeInt24, NewBinaryLiteralFromUint(1<<23, -1), strvalue(1<<23-1))
 	unsignedDeny(c, mysql.TypeInt24, -1, "16777215")
 	unsignedAccept(c, mysql.TypeInt24, 0, "0")
 	unsignedAccept(c, mysql.TypeInt24, 1<<24-1, strvalue(1<<24-1))
 	unsignedDeny(c, mysql.TypeInt24, 1<<24, strvalue(1<<24-1))
+	unsignedAccept(c, mysql.TypeInt24, NewBinaryLiteralFromUint(0, -1), "0")
+	unsignedAccept(c, mysql.TypeInt24, NewBinaryLiteralFromUint(1<<24-1, -1), strvalue(1<<24-1))
+	unsignedDeny(c, mysql.TypeInt24, NewBinaryLiteralFromUint(1<<24, -1), strvalue(1<<24-1))
 
 	signedDeny(c, mysql.TypeLong, int64(math.MinInt32)-1, strvalue(int64(math.MinInt32)))
 	signedAccept(c, mysql.TypeLong, int64(math.MinInt32), strvalue(int64(math.MinInt32)))
@@ -597,19 +612,29 @@ func (s *testTypeConvertSuite) TestConvert(c *C) {
 	signedDeny(c, mysql.TypeLong, uint64(math.MaxUint64), strvalue(uint64(math.MaxInt32)))
 	signedDeny(c, mysql.TypeLong, int64(math.MaxInt32)+1, strvalue(int64(math.MaxInt32)))
 	signedDeny(c, mysql.TypeLong, "1343545435346432587475", strvalue(int64(math.MaxInt32)))
+	signedAccept(c, mysql.TypeLong, NewBinaryLiteralFromUint(math.MaxInt32, -1), strvalue(int64(math.MaxInt32)))
+	signedDeny(c, mysql.TypeLong, NewBinaryLiteralFromUint(math.MaxUint64, -1), strvalue(int64(math.MaxInt32)))
+	signedDeny(c, mysql.TypeLong, NewBinaryLiteralFromUint(math.MaxInt32+1, -1), strvalue(int64(math.MaxInt32)))
 	unsignedDeny(c, mysql.TypeLong, -1, "4294967295")
 	unsignedAccept(c, mysql.TypeLong, 0, "0")
 	unsignedAccept(c, mysql.TypeLong, uint64(math.MaxUint32), strvalue(uint64(math.MaxUint32)))
 	unsignedDeny(c, mysql.TypeLong, uint64(math.MaxUint32)+1, strvalue(uint64(math.MaxUint32)))
+	unsignedAccept(c, mysql.TypeLong, NewBinaryLiteralFromUint(0, -1), "0")
+	unsignedAccept(c, mysql.TypeLong, NewBinaryLiteralFromUint(math.MaxUint32, -1), strvalue(uint64(math.MaxUint32)))
+	unsignedDeny(c, mysql.TypeLong, NewBinaryLiteralFromUint(math.MaxUint32+1, -1), strvalue(uint64(math.MaxUint32)))
 
 	signedDeny(c, mysql.TypeLonglong, math.MinInt64*1.1, strvalue(int64(math.MinInt64)))
 	signedAccept(c, mysql.TypeLonglong, int64(math.MinInt64), strvalue(int64(math.MinInt64)))
 	signedAccept(c, mysql.TypeLonglong, int64(math.MaxInt64), strvalue(int64(math.MaxInt64)))
 	signedDeny(c, mysql.TypeLonglong, math.MaxInt64*1.1, strvalue(int64(math.MaxInt64)))
+	signedAccept(c, mysql.TypeLonglong, NewBinaryLiteralFromUint(math.MaxInt64, -1), strvalue(int64(math.MaxInt64)))
+	signedDeny(c, mysql.TypeLonglong, NewBinaryLiteralFromUint(math.MaxInt64+1, -1), strvalue(int64(math.MaxInt64)))
 	unsignedAccept(c, mysql.TypeLonglong, -1, "18446744073709551615")
 	unsignedAccept(c, mysql.TypeLonglong, 0, "0")
 	unsignedAccept(c, mysql.TypeLonglong, uint64(math.MaxUint64), strvalue(uint64(math.MaxUint64)))
-	unsignedDeny(c, mysql.TypeLonglong, math.MaxUint64*1.1, strvalue(uint64(math.MaxInt64)))
+	unsignedDeny(c, mysql.TypeLonglong, math.MaxUint64*1.1, strvalue(uint64(math.MaxUint64)))
+	unsignedAccept(c, mysql.TypeLonglong, NewBinaryLiteralFromUint(0, -1), "0")
+	unsignedAccept(c, mysql.TypeLonglong, NewBinaryLiteralFromUint(math.MaxUint64, -1), strvalue(uint64(math.MaxUint64)))
 
 	// integer from string
 	signedAccept(c, mysql.TypeLong, "	  234  ", "234")
@@ -638,7 +663,7 @@ func (s *testTypeConvertSuite) TestConvert(c *C) {
 	signedAccept(c, mysql.TypeFloat, "23.523", "23.523")
 	signedAccept(c, mysql.TypeFloat, int64(123), "123")
 	signedAccept(c, mysql.TypeFloat, uint64(123), "123")
-	signedAccept(c, mysql.TypeFloat, int(123), "123")
+	signedAccept(c, mysql.TypeFloat, 123, "123")
 	signedAccept(c, mysql.TypeFloat, float32(123), "123")
 	signedAccept(c, mysql.TypeFloat, float64(123), "123")
 	signedAccept(c, mysql.TypeDouble, " -23.54", "-23.54")
@@ -739,11 +764,11 @@ func (s *testTypeConvertSuite) TestGetValidInt(c *C) {
 		{"-1-1", "-1", true, true},
 		{"+1+1", "+1", true, true},
 		{"123..34", "123", true, true},
-		{"123.23E-10", "123", true, true},
-		{"1.1e1.3", "1", true, true},
-		{"11e1.3", "11", true, true},
-		{"1.", "1", true, true},
-		{".1", "0", true, true},
+		{"123.23E-10", "0", true, false},
+		{"1.1e1.3", "11", true, true},
+		{"11e1.3", "110", true, true},
+		{"1.", "1", true, false},
+		{".1", "0", true, false},
 		{"", "0", true, true},
 		{"123e+", "123", true, true},
 		{"123de", "123", true, true},
@@ -752,8 +777,8 @@ func (s *testTypeConvertSuite) TestGetValidInt(c *C) {
 	sc.TruncateAsWarning = true
 	sc.InSelectStmt = true
 	warningCount := 0
-	for _, tt := range tests {
-		prefix, err := getValidIntPrefix(sc, tt.origin)
+	for i, tt := range tests {
+		prefix, err := getValidIntPrefix(sc, tt.origin, false)
 		c.Assert(err, IsNil)
 		c.Assert(prefix, Equals, tt.valid)
 		if tt.signed {
@@ -764,7 +789,7 @@ func (s *testTypeConvertSuite) TestGetValidInt(c *C) {
 		c.Assert(err, IsNil)
 		warnings := sc.GetWarnings()
 		if tt.warning {
-			c.Assert(warnings, HasLen, warningCount+1)
+			c.Assert(warnings, HasLen, warningCount+1, Commentf("%d", i))
 			c.Assert(terror.ErrorEqual(warnings[len(warnings)-1].Err, ErrTruncatedWrongVal), IsTrue)
 			warningCount += 1
 		} else {
@@ -795,7 +820,7 @@ func (s *testTypeConvertSuite) TestGetValidInt(c *C) {
 	sc.TruncateAsWarning = false
 	sc.InSelectStmt = false
 	for _, tt := range tests2 {
-		prefix, err := getValidIntPrefix(sc, tt.origin)
+		prefix, err := getValidIntPrefix(sc, tt.origin, false)
 		if tt.warning {
 			c.Assert(terror.ErrorEqual(err, ErrTruncatedWrongVal), IsTrue)
 		} else {
@@ -824,10 +849,12 @@ func (s *testTypeConvertSuite) TestGetValidFloat(c *C) {
 		{"", "0"},
 		{"123e+", "123"},
 		{"123.e", "123."},
+		{"0-123", "0"},
+		{"9-3", "9"},
 	}
 	sc := new(stmtctx.StatementContext)
 	for _, tt := range tests {
-		prefix, _ := getValidFloatPrefix(sc, tt.origin)
+		prefix, _ := getValidFloatPrefix(sc, tt.origin, false)
 		c.Assert(prefix, Equals, tt.valid)
 		_, err := strconv.ParseFloat(prefix, 64)
 		c.Assert(err, IsNil)
@@ -986,8 +1013,9 @@ func (s *testTypeConvertSuite) TestConvertJSONToDecimal(c *C) {
 	for _, tt := range tests {
 		j, err := json.ParseBinaryFromString(tt.In)
 		c.Assert(err, IsNil)
-		casted, _ := ConvertJSONToDecimal(new(stmtctx.StatementContext), j)
-		c.Assert(casted.Compare(tt.Out), Equals, 0)
+		casted, err := ConvertJSONToDecimal(new(stmtctx.StatementContext), j)
+		c.Assert(err, IsNil, Commentf("input: %v, casted: %v, out: %v, json: %#v", tt.In, casted, tt.Out, j))
+		c.Assert(casted.Compare(tt.Out), Equals, 0, Commentf("input: %v, casted: %v, out: %v, json: %#v", tt.In, casted, tt.Out, j))
 	}
 }
 

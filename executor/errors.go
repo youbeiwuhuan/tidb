@@ -14,8 +14,8 @@
 package executor
 
 import (
-	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/parser/terror"
+	mysql "github.com/pingcap/tidb/errno"
 )
 
 // Error instances.
@@ -42,34 +42,9 @@ var (
 	ErrRoleNotGranted              = terror.ClassPrivilege.New(mysql.ErrRoleNotGranted, mysql.MySQLErrName[mysql.ErrRoleNotGranted])
 	ErrDeadlock                    = terror.ClassExecutor.New(mysql.ErrLockDeadlock, mysql.MySQLErrName[mysql.ErrLockDeadlock])
 	ErrQueryInterrupted            = terror.ClassExecutor.New(mysql.ErrQueryInterrupted, mysql.MySQLErrName[mysql.ErrQueryInterrupted])
+
+	ErrBRIEBackupFailed  = terror.ClassExecutor.New(mysql.ErrBRIEBackupFailed, mysql.MySQLErrName[mysql.ErrBRIEBackupFailed])
+	ErrBRIERestoreFailed = terror.ClassExecutor.New(mysql.ErrBRIERestoreFailed, mysql.MySQLErrName[mysql.ErrBRIERestoreFailed])
+	ErrBRIEImportFailed  = terror.ClassExecutor.New(mysql.ErrBRIEImportFailed, mysql.MySQLErrName[mysql.ErrBRIEImportFailed])
+	ErrBRIEExportFailed  = terror.ClassExecutor.New(mysql.ErrBRIEExportFailed, mysql.MySQLErrName[mysql.ErrBRIEExportFailed])
 )
-
-func init() {
-	// Map error codes to mysql error codes.
-	tableMySQLErrCodes := map[terror.ErrCode]uint16{
-		mysql.ErrGetStartTS:      mysql.ErrGetStartTS,
-		mysql.ErrUnknownPlan:     mysql.ErrUnknownPlan,
-		mysql.ErrPrepareMulti:    mysql.ErrPrepareMulti,
-		mysql.ErrPrepareDDL:      mysql.ErrPrepareDDL,
-		mysql.ErrResultIsEmpty:   mysql.ErrResultIsEmpty,
-		mysql.ErrBuildExecutor:   mysql.ErrBuildExecutor,
-		mysql.ErrBatchInsertFail: mysql.ErrBatchInsertFail,
-
-		mysql.ErrCantCreateUserWithGrant:     mysql.ErrCantCreateUserWithGrant,
-		mysql.ErrPasswordNoMatch:             mysql.ErrPasswordNoMatch,
-		mysql.ErrCannotUser:                  mysql.ErrCannotUser,
-		mysql.ErrPasswordFormat:              mysql.ErrPasswordFormat,
-		mysql.ErrCantChangeTxCharacteristics: mysql.ErrCantChangeTxCharacteristics,
-		mysql.ErrPsManyParam:                 mysql.ErrPsManyParam,
-		mysql.ErrAdminCheckTable:             mysql.ErrAdminCheckTable,
-		mysql.ErrDBaccessDenied:              mysql.ErrDBaccessDenied,
-		mysql.ErrTableaccessDenied:           mysql.ErrTableaccessDenied,
-		mysql.ErrBadDB:                       mysql.ErrBadDB,
-		mysql.ErrWrongObject:                 mysql.ErrWrongObject,
-		mysql.ErrRoleNotGranted:              mysql.ErrRoleNotGranted,
-		mysql.ErrLockDeadlock:                mysql.ErrLockDeadlock,
-		mysql.ErrQueryInterrupted:            mysql.ErrQueryInterrupted,
-		mysql.ErrWrongValueCountOnRow:        mysql.ErrWrongValueCountOnRow,
-	}
-	terror.ErrClassToMySQLCodes[terror.ClassExecutor] = tableMySQLErrCodes
-}

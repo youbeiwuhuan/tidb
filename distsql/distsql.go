@@ -166,9 +166,7 @@ func canUseChunkRPC(ctx sessionctx.Context) bool {
 	return true
 }
 
-var supportedAlignment = !(unsafe.Sizeof(types.MysqlTime{}) != 16 ||
-	unsafe.Sizeof(types.Time{}) != 20 ||
-	unsafe.Sizeof(types.MyDecimal{}) != 40)
+var supportedAlignment = unsafe.Sizeof(types.MyDecimal{}) == 40
 
 // checkAlignment checks the alignment in current system environment.
 // The alignment is influenced by system, machine and Golang version.
@@ -190,7 +188,7 @@ func GetSystemEndian() tipb.Endian {
 }
 
 func init() {
-	var i int = 0x0100
+	i := 0x0100
 	ptr := unsafe.Pointer(&i)
 	if 0x01 == *(*byte)(ptr) {
 		systemEndian = tipb.Endian_BigEndian

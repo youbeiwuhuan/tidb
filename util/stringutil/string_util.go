@@ -14,12 +14,12 @@
 package stringutil
 
 import (
-	"bytes"
 	"fmt"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/util/hack"
 )
 
@@ -127,15 +127,17 @@ func Unquote(s string) (t string, err error) {
 }
 
 const (
-	patMatch = iota + 1
-	patOne
-	patAny
+	// PatMatch is the enumeration value for per-character match.
+	PatMatch = iota + 1
+	// PatOne is the enumeration value for '_' match.
+	PatOne
+	// PatAny is the enumeration value for '%' match.
+	PatAny
 )
 
 // CompilePattern handles escapes and wild cards convert pattern characters and
 // pattern types.
 func CompilePattern(pattern string, escape byte) (patChars, patTypes []byte) {
-	var lastAny bool
 	patChars = make([]byte, len(pattern))
 	patTypes = make([]byte, len(pattern))
 	patLen := 0
@@ -144,8 +146,7 @@ func CompilePattern(pattern string, escape byte) (patChars, patTypes []byte) {
 		var c = pattern[i]
 		switch c {
 		case escape:
-			lastAny = false
-			tp = patMatch
+			tp = PatMatch
 			if i < len(pattern)-1 {
 				i++
 				c = pattern[i]
@@ -163,19 +164,22 @@ func CompilePattern(pattern string, escape byte) (patChars, patTypes []byte) {
 				}
 			}
 		case '_':
-			if lastAny {
-				continue
+			// %_ => _%
+			if patLen > 0 && patTypes[patLen-1] == PatAny {
+				tp = PatAny
+				c = '%'
+				patChars[patLen-1], patTypes[patLen-1] = '_', PatOne
+			} else {
+				tp = PatOne
 			}
-			tp = patOne
 		case '%':
-			if lastAny {
+			// %% => %
+			if patLen > 0 && patTypes[patLen-1] == PatAny {
 				continue
 			}
-			lastAny = true
-			tp = patAny
+			tp = PatAny
 		default:
-			lastAny = false
-			tp = patMatch
+			tp = PatMatch
 		}
 		patChars[patLen] = c
 		patTypes[patLen] = tp
@@ -186,8 +190,7 @@ func CompilePattern(pattern string, escape byte) (patChars, patTypes []byte) {
 	return
 }
 
-// NOTE: Currently tikv's like function is case sensitive, so we keep its behavior here.
-func matchByteCI(a, b byte) bool {
+func matchByte(a, b byte) bool {
 	return a == b
 	// We may reuse below code block when like function go back to case insensitive.
 	/*
@@ -207,24 +210,12 @@ func CompileLike2Regexp(str string) string {
 	var result []byte
 	for i := 0; i < len(patChars); i++ {
 		switch patTypes[i] {
-		case patMatch:
+		case PatMatch:
 			result = append(result, patChars[i])
-		case patOne:
-			// .*. == .*
-			if !bytes.HasSuffix(result, []byte{'.', '*'}) {
-				result = append(result, '.')
-			}
-		case patAny:
-			// ..* == .*
-			if bytes.HasSuffix(result, []byte{'.'}) {
-				result = append(result, '*')
-				continue
-			}
-			// .*.* == .*
-			if !bytes.HasSuffix(result, []byte{'.', '*'}) {
-				result = append(result, '.')
-				result = append(result, '*')
-			}
+		case PatOne:
+			result = append(result, '.')
+		case PatAny:
+			result = append(result, '.', '*')
 		}
 	}
 	return string(result)
@@ -238,19 +229,19 @@ func DoMatch(str string, patChars, patTypes []byte) bool {
 	for pIdx < len(patChars) || sIdx < len(str) {
 		if pIdx < len(patChars) {
 			switch patTypes[pIdx] {
-			case patMatch:
-				if sIdx < len(str) && matchByteCI(str[sIdx], patChars[pIdx]) {
+			case PatMatch:
+				if sIdx < len(str) && matchByte(str[sIdx], patChars[pIdx]) {
 					pIdx++
 					sIdx++
 					continue
 				}
-			case patOne:
+			case PatOne:
 				if sIdx < len(str) {
 					pIdx++
 					sIdx++
 					continue
 				}
-			case patAny:
+			case PatAny:
 				// Try to match at sIdx.
 				// If that doesn't work out,
 				// restart at sIdx+1 next.
@@ -275,7 +266,7 @@ func DoMatch(str string, patChars, patTypes []byte) bool {
 // IsExactMatch return true if no wildcard character
 func IsExactMatch(patTypes []byte) bool {
 	for _, pt := range patTypes {
-		if pt != patMatch {
+		if pt != PatMatch {
 			return false
 		}
 	}
@@ -309,4 +300,18 @@ type StringerStr string
 // String implements fmt.Stringer
 func (i StringerStr) String() string {
 	return string(i)
+}
+
+// Escape the identifier for pretty-printing.
+// For instance, the identifier "foo `bar`" will become "`foo ``bar```".
+// The sqlMode controls whether to escape with backquotes (`) or double quotes
+// (`"`) depending on whether mysql.ModeANSIQuotes is enabled.
+func Escape(str string, sqlMode mysql.SQLMode) string {
+	var quote string
+	if sqlMode&mysql.ModeANSIQuotes != 0 {
+		quote = `"`
+	} else {
+		quote = "`"
+	}
+	return quote + strings.Replace(str, quote, quote+quote, -1) + quote
 }

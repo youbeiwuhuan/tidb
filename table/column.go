@@ -22,8 +22,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
+	"github.com/pingcap/parser"
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/parser/charset"
 	"github.com/pingcap/parser/model"
@@ -46,6 +48,8 @@ type Column struct {
 	*model.ColumnInfo
 	// If this column is a generated column, the expression will be stored here.
 	GeneratedExpr ast.ExprNode
+	// If this column has default expr value, this expression will be stored here.
+	DefaultExpr ast.ExprNode
 }
 
 // String implements fmt.Stringer interface.
@@ -80,6 +84,7 @@ func FindCol(cols []*Column, name string) *Column {
 func ToColumn(col *model.ColumnInfo) *Column {
 	return &Column{
 		col,
+		nil,
 		nil,
 	}
 }
@@ -118,7 +123,7 @@ func FindOnUpdateCols(cols []*Column) []*Column {
 	return rcols
 }
 
-// truncateTrailingSpaces trancates trailing spaces for CHAR[(M)] column.
+// truncateTrailingSpaces truncates trailing spaces for CHAR[(M)] column.
 // fix: https://github.com/pingcap/tidb/issues/3660
 func truncateTrailingSpaces(v *types.Datum) {
 	if v.Kind() == types.KindNull {
@@ -131,7 +136,7 @@ func truncateTrailingSpaces(v *types.Datum) {
 	}
 	b = b[:length]
 	str := string(hack.String(b))
-	v.SetString(str)
+	v.SetString(str, v.Collation())
 }
 
 // CastValues casts values based on columns type.
@@ -139,7 +144,7 @@ func CastValues(ctx sessionctx.Context, rec []types.Datum, cols []*Column) (err 
 	sc := ctx.GetSessionVars().StmtCtx
 	for _, c := range cols {
 		var converted types.Datum
-		converted, err = CastValue(ctx, rec[c.Offset], c.ToInfo())
+		converted, err = CastValue(ctx, rec[c.Offset], c.ToInfo(), false, false)
 		if err != nil {
 			if sc.DupKeyAsWarning {
 				sc.AppendWarning(err)
@@ -153,6 +158,15 @@ func CastValues(ctx sessionctx.Context, rec []types.Datum, cols []*Column) (err 
 	return nil
 }
 
+func handleWrongASCIIValue(ctx sessionctx.Context, col *model.ColumnInfo, casted *types.Datum, str string, i int) (types.Datum, error) {
+	sc := ctx.GetSessionVars().StmtCtx
+	err := ErrTruncatedWrongValueForField.FastGen("incorrect ascii value %x(%s) for column %s", casted.GetBytes(), str, col.Name)
+	logutil.BgLogger().Error("incorrect ASCII value", zap.Uint64("conn", ctx.GetSessionVars().ConnectionID), zap.Error(err))
+	truncateVal := types.NewStringDatum(str[:i])
+	err = sc.HandleTruncate(err)
+	return truncateVal, err
+}
+
 func handleWrongUtf8Value(ctx sessionctx.Context, col *model.ColumnInfo, casted *types.Datum, str string, i int) (types.Datum, error) {
 	sc := ctx.GetSessionVars().StmtCtx
 	err := ErrTruncatedWrongValueForField.FastGen("incorrect utf8 value %x(%s) for column %s", casted.GetBytes(), str, col.Name)
@@ -164,12 +178,20 @@ func handleWrongUtf8Value(ctx sessionctx.Context, col *model.ColumnInfo, casted 
 }
 
 // CastValue casts a value based on column type.
+// If forceIgnoreTruncate is true, truncated errors will be ignored.
+// If returnOverflow is true, don't handle overflow errors in this function.
+// It's safe now and it's the same as the behavior of select statement.
+// Set it to true only in FillVirtualColumnValue and UnionScanExec.Next()
+// If the handle of err is changed latter, the behavior of forceIgnoreTruncate also need to change.
 // TODO: change the third arg to TypeField. Not pass ColumnInfo.
-func CastValue(ctx sessionctx.Context, val types.Datum, col *model.ColumnInfo) (casted types.Datum, err error) {
+func CastValue(ctx sessionctx.Context, val types.Datum, col *model.ColumnInfo, returnOverflow, forceIgnoreTruncate bool) (casted types.Datum, err error) {
 	sc := ctx.GetSessionVars().StmtCtx
 	casted, err = val.ConvertTo(sc, &col.FieldType)
 	// TODO: make sure all truncate errors are handled by ConvertTo.
-	if types.ErrTruncated.Equal(err) {
+	if returnOverflow && types.ErrOverflow.Equal(err) {
+		return casted, err
+	}
+	if err != nil && types.ErrTruncated.Equal(err) {
 		str, err1 := val.ToString()
 		if err1 != nil {
 			logutil.BgLogger().Warn("Datum ToString failed", zap.Stringer("Datum", val), zap.Error(err1))
@@ -178,7 +200,9 @@ func CastValue(ctx sessionctx.Context, val types.Datum, col *model.ColumnInfo) (
 	} else {
 		err = sc.HandleTruncate(err)
 	}
-	if err != nil {
+	if forceIgnoreTruncate {
+		err = nil
+	} else if err != nil {
 		return casted, err
 	}
 
@@ -186,9 +210,28 @@ func CastValue(ctx sessionctx.Context, val types.Datum, col *model.ColumnInfo) (
 		truncateTrailingSpaces(&casted)
 	}
 
+	if col.Charset == charset.CharsetASCII {
+		if ctx.GetSessionVars().SkipASCIICheck {
+			return casted, nil
+		}
+
+		str := casted.GetString()
+		for i := 0; i < len(str); i++ {
+			if str[i] > unicode.MaxASCII {
+				casted, err = handleWrongASCIIValue(ctx, col, &casted, str, i)
+				break
+			}
+		}
+		if forceIgnoreTruncate {
+			err = nil
+		}
+		return casted, err
+	}
+
 	if ctx.GetSessionVars().SkipUTF8Check {
 		return casted, nil
 	}
+
 	if !mysql.IsUTF8Charset(col.Charset) {
 		return casted, nil
 	}
@@ -212,6 +255,9 @@ func CastValue(ctx sessionctx.Context, val types.Datum, col *model.ColumnInfo) (
 		w = width
 	}
 
+	if forceIgnoreTruncate {
+		err = nil
+	}
 	return casted, err
 }
 
@@ -323,7 +369,7 @@ func CheckOnce(cols []*Column) error {
 }
 
 // CheckNotNull checks if nil value set to a column with NotNull flag is set.
-func (c *Column) CheckNotNull(data types.Datum) error {
+func (c *Column) CheckNotNull(data *types.Datum) error {
 	if (mysql.HasNotNullFlag(c.Flag) || mysql.HasPreventNullInsertFlag(c.Flag)) && data.IsNull() {
 		return ErrColumnCantNull.GenWithStackByArgs(c.Name)
 	}
@@ -332,15 +378,16 @@ func (c *Column) CheckNotNull(data types.Datum) error {
 
 // HandleBadNull handles the bad null error.
 // If BadNullAsWarning is true, it will append the error as a warning, else return the error.
-func (c *Column) HandleBadNull(d types.Datum, sc *stmtctx.StatementContext) (types.Datum, error) {
+func (c *Column) HandleBadNull(d *types.Datum, sc *stmtctx.StatementContext) error {
 	if err := c.CheckNotNull(d); err != nil {
 		if sc.BadNullAsWarning {
 			sc.AppendWarning(err)
-			return GetZeroValue(c.ToInfo()), nil
+			*d = GetZeroValue(c.ToInfo())
+			return nil
 		}
-		return types.Datum{}, err
+		return err
 	}
-	return d, nil
+	return nil
 }
 
 // IsPKHandleColumn checks if the column is primary key handle column.
@@ -348,10 +395,15 @@ func (c *Column) IsPKHandleColumn(tbInfo *model.TableInfo) bool {
 	return mysql.HasPriKeyFlag(c.Flag) && tbInfo.PKIsHandle
 }
 
+// IsCommonHandleColumn checks if the column is common handle column.
+func (c *Column) IsCommonHandleColumn(tbInfo *model.TableInfo) bool {
+	return mysql.HasPriKeyFlag(c.Flag) && tbInfo.IsCommonHandle
+}
+
 // CheckNotNull checks if row has nil value set to a column with NotNull flag set.
 func CheckNotNull(cols []*Column, row []types.Datum) error {
 	for _, c := range cols {
-		if err := c.CheckNotNull(row[c.Offset]); err != nil {
+		if err := c.CheckNotNull(&row[c.Offset]); err != nil {
 			return err
 		}
 	}
@@ -371,7 +423,44 @@ func GetColOriginDefaultValue(ctx sessionctx.Context, col *model.ColumnInfo) (ty
 
 // GetColDefaultValue gets default value of the column.
 func GetColDefaultValue(ctx sessionctx.Context, col *model.ColumnInfo) (types.Datum, error) {
-	return getColDefaultValue(ctx, col, col.GetDefaultValue())
+	defaultValue := col.GetDefaultValue()
+	if !col.DefaultIsExpr {
+		return getColDefaultValue(ctx, col, defaultValue)
+	}
+	return getColDefaultExprValue(ctx, col, defaultValue.(string))
+}
+
+// EvalColDefaultExpr eval default expr node to explicit default value.
+func EvalColDefaultExpr(ctx sessionctx.Context, col *model.ColumnInfo, defaultExpr ast.ExprNode) (types.Datum, error) {
+	d, err := expression.EvalAstExpr(ctx, defaultExpr)
+	if err != nil {
+		return types.Datum{}, err
+	}
+	// Check the evaluated data type by cast.
+	value, err := CastValue(ctx, d, col, false, false)
+	if err != nil {
+		return types.Datum{}, err
+	}
+	return value, nil
+}
+
+func getColDefaultExprValue(ctx sessionctx.Context, col *model.ColumnInfo, defaultValue string) (types.Datum, error) {
+	var defaultExpr ast.ExprNode
+	expr := fmt.Sprintf("select %s", defaultValue)
+	stmts, _, err := parser.New().Parse(expr, "", "")
+	if err == nil {
+		defaultExpr = stmts[0].(*ast.SelectStmt).Fields.Fields[0].Expr
+	}
+	d, err := expression.EvalAstExpr(ctx, defaultExpr)
+	if err != nil {
+		return types.Datum{}, err
+	}
+	// Check the evaluated data type by cast.
+	value, err := CastValue(ctx, d, col, false, false)
+	if err != nil {
+		return types.Datum{}, err
+	}
+	return value, nil
 }
 
 func getColDefaultValue(ctx sessionctx.Context, col *model.ColumnInfo, defaultVal interface{}) (types.Datum, error) {
@@ -380,7 +469,7 @@ func getColDefaultValue(ctx sessionctx.Context, col *model.ColumnInfo, defaultVa
 	}
 
 	if col.Tp != mysql.TypeTimestamp && col.Tp != mysql.TypeDatetime {
-		value, err := CastValue(ctx, types.NewDatum(defaultVal), col)
+		value, err := CastValue(ctx, types.NewDatum(defaultVal), col, false, false)
 		if err != nil {
 			return types.Datum{}, err
 		}
@@ -430,7 +519,7 @@ func getColDefaultValueFromNil(ctx sessionctx.Context, col *model.ColumnInfo) (t
 		if err != nil {
 			return types.Datum{}, err
 		}
-		return types.NewMysqlEnumDatum(defEnum), nil
+		return types.NewCollateMysqlEnumDatum(defEnum, col.Collate), nil
 	}
 	if mysql.HasAutoIncrementFlag(col.Flag) {
 		// Auto increment column doesn't has default value and we should not return error.
@@ -464,15 +553,17 @@ func GetZeroValue(col *model.ColumnInfo) types.Datum {
 	case mysql.TypeDouble:
 		d.SetFloat64(0)
 	case mysql.TypeNewDecimal:
+		d.SetLength(col.Flen)
+		d.SetFrac(col.Decimal)
 		d.SetMysqlDecimal(new(types.MyDecimal))
 	case mysql.TypeString:
 		if col.Flen > 0 && col.Charset == charset.CharsetBin {
 			d.SetBytes(make([]byte, col.Flen))
 		} else {
-			d.SetString("")
+			d.SetString("", col.Collate)
 		}
 	case mysql.TypeVarString, mysql.TypeVarchar:
-		d.SetString("")
+		d.SetString("", col.Collate)
 	case mysql.TypeBlob, mysql.TypeTinyBlob, mysql.TypeMediumBlob, mysql.TypeLongBlob:
 		d.SetBytes([]byte{})
 	case mysql.TypeDuration:
@@ -486,9 +577,9 @@ func GetZeroValue(col *model.ColumnInfo) types.Datum {
 	case mysql.TypeBit:
 		d.SetMysqlBit(types.ZeroBinaryLiteral)
 	case mysql.TypeSet:
-		d.SetMysqlSet(types.Set{})
+		d.SetMysqlSet(types.Set{}, col.Collate)
 	case mysql.TypeEnum:
-		d.SetMysqlEnum(types.Enum{})
+		d.SetMysqlEnum(types.Enum{}, col.Collate)
 	case mysql.TypeJSON:
 		d.SetMysqlJSON(json.CreateBinary(nil))
 	}

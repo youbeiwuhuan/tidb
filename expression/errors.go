@@ -45,33 +45,10 @@ var (
 	errTruncatedWrongValue           = terror.ClassExpression.New(mysql.ErrTruncatedWrongValue, mysql.MySQLErrName[mysql.ErrTruncatedWrongValue])
 	errUnknownLocale                 = terror.ClassExpression.New(mysql.ErrUnknownLocale, mysql.MySQLErrName[mysql.ErrUnknownLocale])
 	errNonUniq                       = terror.ClassExpression.New(mysql.ErrNonUniq, mysql.MySQLErrName[mysql.ErrNonUniq])
-)
 
-func init() {
-	expressionMySQLErrCodes := map[terror.ErrCode]uint16{
-		mysql.ErrWrongParamcountToNativeFct:        mysql.ErrWrongParamcountToNativeFct,
-		mysql.ErrDivisionByZero:                    mysql.ErrDivisionByZero,
-		mysql.ErrSpDoesNotExist:                    mysql.ErrSpDoesNotExist,
-		mysql.ErrNotSupportedYet:                   mysql.ErrNotSupportedYet,
-		mysql.ErrZlibZData:                         mysql.ErrZlibZData,
-		mysql.ErrZlibZBuf:                          mysql.ErrZlibZBuf,
-		mysql.ErrWrongArguments:                    mysql.ErrWrongArguments,
-		mysql.ErrUnknownCharacterSet:               mysql.ErrUnknownCharacterSet,
-		mysql.ErrInvalidDefault:                    mysql.ErrInvalidDefault,
-		mysql.ErrWarnDeprecatedSyntaxNoReplacement: mysql.ErrWarnDeprecatedSyntaxNoReplacement,
-		mysql.ErrOperandColumns:                    mysql.ErrOperandColumns,
-		mysql.ErrCutValueGroupConcat:               mysql.ErrCutValueGroupConcat,
-		mysql.ErrRegexp:                            mysql.ErrRegexp,
-		mysql.ErrWarnAllowedPacketOverflowed:       mysql.ErrWarnAllowedPacketOverflowed,
-		mysql.WarnOptionIgnored:                    mysql.WarnOptionIgnored,
-		mysql.ErrTruncatedWrongValue:               mysql.ErrTruncatedWrongValue,
-		mysql.ErrUnknownLocale:                     mysql.ErrUnknownLocale,
-		mysql.ErrBadField:                          mysql.ErrBadField,
-		mysql.ErrNonUniq:                           mysql.ErrNonUniq,
-		mysql.ErrIncorrectType:                     mysql.ErrIncorrectType,
-	}
-	terror.ErrClassToMySQLCodes[terror.ClassExpression] = expressionMySQLErrCodes
-}
+	// Sequence usage privilege check.
+	errSequenceAccessDenied = terror.ClassExpression.New(mysql.ErrTableaccessDenied, mysql.MySQLErrName[mysql.ErrTableaccessDenied])
+)
 
 // handleInvalidTimeError reports error or warning depend on the context.
 func handleInvalidTimeError(ctx sessionctx.Context, err error) error {
@@ -81,10 +58,10 @@ func handleInvalidTimeError(ctx sessionctx.Context, err error) error {
 		return err
 	}
 	sc := ctx.GetSessionVars().StmtCtx
+	err = sc.HandleTruncate(err)
 	if ctx.GetSessionVars().StrictSQLMode && (sc.InInsertStmt || sc.InUpdateStmt || sc.InDeleteStmt) {
 		return err
 	}
-	sc.AppendWarning(err)
 	return nil
 }
 

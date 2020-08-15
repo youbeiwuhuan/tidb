@@ -20,15 +20,19 @@ import (
 	"sync/atomic"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/failpoint"
 	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/expression"
 	plannercore "github.com/pingcap/tidb/planner/core"
+	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/bitmap"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/disk"
+	"github.com/pingcap/tidb/util/execdetails"
 	"github.com/pingcap/tidb/util/memory"
 	"github.com/pingcap/tidb/util/stringutil"
 )
@@ -48,6 +52,9 @@ type HashJoinExec struct {
 	outerFilter       expression.CNFExprs
 	probeKeys         []*expression.Column
 	buildKeys         []*expression.Column
+	isNullEQ          []bool
+	probeTypes        []*types.FieldType
+	buildTypes        []*types.FieldType
 
 	// concurrency is the number of partition, build and join workers.
 	concurrency   uint
@@ -134,7 +141,12 @@ func (e *HashJoinExec) Close() error {
 
 	if e.runtimeStats != nil {
 		concurrency := cap(e.joiners)
-		e.runtimeStats.SetConcurrencyInfo("Concurrency", concurrency)
+		runtimeStats := newJoinRuntimeStats(e.runtimeStats)
+		e.ctx.GetSessionVars().StmtCtx.RuntimeStatsColl.RegisterStats(e.id.String(), runtimeStats)
+		runtimeStats.SetConcurrencyInfo(execdetails.NewConcurrencyInfo("Concurrency", concurrency))
+		if e.rowContainer != nil {
+			runtimeStats.setHashStat(e.rowContainer.stat)
+		}
 	}
 	err := e.baseExecutor.Close()
 	return err
@@ -156,6 +168,13 @@ func (e *HashJoinExec) Open(ctx context.Context) error {
 	e.closeCh = make(chan struct{})
 	e.finished.Store(false)
 	e.joinWorkerWaitGroup = sync.WaitGroup{}
+
+	if e.probeTypes == nil {
+		e.probeTypes = retTypes(e.probeSideExec)
+	}
+	if e.buildTypes == nil {
+		e.buildTypes = retTypes(e.buildSideExec)
+	}
 	return nil
 }
 
@@ -195,13 +214,13 @@ func (e *HashJoinExec) fetchProbeSideChunks(ctx context.Context) {
 				e.finished.Store(true)
 				return
 			}
-			jobFinished, buildErr := e.wait4BuildSide()
+			emptyBuild, buildErr := e.wait4BuildSide()
 			if buildErr != nil {
 				e.joinResultCh <- &hashjoinWorkerResult{
 					err: buildErr,
 				}
 				return
-			} else if jobFinished {
+			} else if emptyBuild {
 				return
 			}
 			hasWaitedForBuild = true
@@ -215,7 +234,7 @@ func (e *HashJoinExec) fetchProbeSideChunks(ctx context.Context) {
 	}
 }
 
-func (e *HashJoinExec) wait4BuildSide() (finished bool, err error) {
+func (e *HashJoinExec) wait4BuildSide() (emptyBuild bool, err error) {
 	select {
 	case <-e.closeCh:
 		return true, nil
@@ -224,7 +243,7 @@ func (e *HashJoinExec) wait4BuildSide() (finished bool, err error) {
 			return false, err
 		}
 	}
-	if e.rowContainer.Len() == 0 && (e.joinType == plannercore.InnerJoin || e.joinType == plannercore.SemiJoin) {
+	if e.rowContainer.Len() == uint64(0) && (e.joinType == plannercore.InnerJoin || e.joinType == plannercore.SemiJoin) {
 		return true, nil
 	}
 	return false, nil
@@ -247,6 +266,7 @@ func (e *HashJoinExec) fetchBuildSideRows(ctx context.Context, chkCh chan<- *chu
 			e.buildFinished <- errors.Trace(err)
 			return
 		}
+		failpoint.Inject("errorFetchBuildSideRowsMockOOMPanic", nil)
 		if chk.NumRows() == 0 {
 			return
 		}
@@ -330,14 +350,20 @@ func (e *HashJoinExec) handleJoinWorkerPanic(r interface{}) {
 }
 
 // Concurrently handling unmatched rows from the hash table
-func (e *HashJoinExec) handleUnmatchedRowsFromHashTableInMemory(workerID uint) {
+func (e *HashJoinExec) handleUnmatchedRowsFromHashTable(workerID uint) {
 	ok, joinResult := e.getNewJoinResult(workerID)
 	if !ok {
 		return
 	}
 	numChks := e.rowContainer.NumChunks()
 	for i := int(workerID); i < numChks; i += int(e.concurrency) {
-		chk := e.rowContainer.GetChunk(i)
+		chk, err := e.rowContainer.GetChunk(i)
+		if err != nil {
+			// Catching the error and send it
+			joinResult.err = err
+			e.joinResultCh <- joinResult
+			return
+		}
 		for j := 0; j < chk.NumRows(); j++ {
 			if !e.outerMatchedStatus[i].UnsafeIsSet(j) { // process unmatched outer rows
 				e.joiners[workerID].onMissMatch(false, chk.GetRow(j), joinResult.chk)
@@ -359,57 +385,16 @@ func (e *HashJoinExec) handleUnmatchedRowsFromHashTableInMemory(workerID uint) {
 	}
 }
 
-// Sequentially handling unmatched rows from the hash table
-func (e *HashJoinExec) handleUnmatchedRowsFromHashTableInDisk(workerID uint) {
-	ok, joinResult := e.getNewJoinResult(workerID)
-	if !ok {
-		return
-	}
-	numChks := e.rowContainer.NumChunks()
-	for i := 0; i < numChks; i++ {
-		numOfRows := e.rowContainer.NumRowsOfChunk(i)
-		for j := 0; j < numOfRows; j++ {
-			row, err := e.rowContainer.GetRow(chunk.RowPtr{ChkIdx: uint32(i), RowIdx: uint32(j)})
-			if err != nil {
-				// Catching the error and send it
-				joinResult.err = err
-				e.joinResultCh <- joinResult
-				return
-			}
-			if !e.outerMatchedStatus[i].UnsafeIsSet(j) { // process unmatched outer rows
-				e.joiners[workerID].onMissMatch(false, row, joinResult.chk)
-			}
-			if joinResult.chk.IsFull() {
-				e.joinResultCh <- joinResult
-				ok, joinResult = e.getNewJoinResult(workerID)
-				if !ok {
-					return
-				}
-			}
-		}
-	}
-	if joinResult == nil {
-		return
-	} else if joinResult.err != nil || (joinResult.chk != nil && joinResult.chk.NumRows() > 0) {
-		e.joinResultCh <- joinResult
-	}
-}
-
 func (e *HashJoinExec) waitJoinWorkersAndCloseResultChan() {
 	e.joinWorkerWaitGroup.Wait()
 	if e.useOuterToBuild {
-		if e.rowContainer.alreadySpilled() {
-			// Sequentially handling unmatched rows from the hash table to avoid random accessing IO
-			e.handleUnmatchedRowsFromHashTableInDisk(0)
-		} else {
-			// Concurrently handling unmatched rows from the hash table at the tail
-			for i := uint(0); i < e.concurrency; i++ {
-				var workerID = i
-				e.joinWorkerWaitGroup.Add(1)
-				go util.WithRecovery(func() { e.handleUnmatchedRowsFromHashTableInMemory(workerID) }, e.handleJoinWorkerPanic)
-			}
-			e.joinWorkerWaitGroup.Wait()
+		// Concurrently handling unmatched rows from the hash table at the tail
+		for i := uint(0); i < e.concurrency; i++ {
+			var workerID = i
+			e.joinWorkerWaitGroup.Add(1)
+			go util.WithRecovery(func() { e.handleUnmatchedRowsFromHashTable(workerID) }, e.handleJoinWorkerPanic)
 		}
+		e.joinWorkerWaitGroup.Wait()
 	}
 	close(e.joinResultCh)
 }
@@ -429,7 +414,7 @@ func (e *HashJoinExec) runJoinWorker(workerID uint, probeKeyColIdx []int) {
 		dest: e.probeResultChs[workerID],
 	}
 	hCtx := &hashContext{
-		allTypes:  retTypes(e.probeSideExec),
+		allTypes:  e.probeTypes,
 		keyColIdx: probeKeyColIdx,
 	}
 	for ok := true; ok; {
@@ -456,11 +441,12 @@ func (e *HashJoinExec) runJoinWorker(workerID uint, probeKeyColIdx []int) {
 		emptyProbeSideResult.chk = probeSideResult
 		e.probeChkResourceCh <- emptyProbeSideResult
 	}
+	// note joinResult.chk may be nil when getNewJoinResult fails in loops
 	if joinResult == nil {
 		return
 	} else if joinResult.err != nil || (joinResult.chk != nil && joinResult.chk.NumRows() > 0) {
 		e.joinResultCh <- joinResult
-	} else if joinResult.chk.NumRows() == 0 {
+	} else if joinResult.chk != nil && joinResult.chk.NumRows() == 0 {
 		e.joinChkResourceCh[workerID] <- joinResult.chk
 	}
 }
@@ -478,6 +464,7 @@ func (e *HashJoinExec) joinMatchedProbeSideRow2ChunkForOuterHashJoin(workerID ui
 
 	iter := chunk.NewIterator4Slice(buildSideRows)
 	var outerMatchStatus []outerRowStatusFlag
+	rowIdx := 0
 	for iter.Begin(); iter.Current() != iter.End(); {
 		outerMatchStatus, err = e.joiners[workerID].tryToMatchOuters(iter, probeSideRow, joinResult.chk, outerMatchStatus)
 		if err != nil {
@@ -486,9 +473,10 @@ func (e *HashJoinExec) joinMatchedProbeSideRow2ChunkForOuterHashJoin(workerID ui
 		}
 		for i := range outerMatchStatus {
 			if outerMatchStatus[i] == outerRowMatched {
-				e.outerMatchedStatus[rowsPtrs[i].ChkIdx].Set(int(rowsPtrs[i].RowIdx))
+				e.outerMatchedStatus[rowsPtrs[rowIdx+i].ChkIdx].Set(int(rowsPtrs[rowIdx+i].RowIdx))
 			}
 		}
+		rowIdx += len(outerMatchStatus)
 		if joinResult.chk.IsFull() {
 			e.joinResultCh <- joinResult
 			ok, joinResult := e.getNewJoinResult(workerID)
@@ -558,8 +546,9 @@ func (e *HashJoinExec) join2Chunk(workerID uint, probeSideChk *chunk.Chunk, hCtx
 	}
 
 	hCtx.initHash(probeSideChk.NumRows())
-	for _, i := range hCtx.keyColIdx {
-		err = codec.HashChunkSelected(e.rowContainer.sc, hCtx.hashVals, probeSideChk, hCtx.allTypes[i], i, hCtx.buf, hCtx.hasNull, selected)
+	for keyIdx, i := range hCtx.keyColIdx {
+		ignoreNull := len(e.isNullEQ) > keyIdx && e.isNullEQ[keyIdx]
+		err = codec.HashChunkSelected(e.rowContainer.sc, hCtx.hashVals, probeSideChk, hCtx.allTypes[i], i, hCtx.buf, hCtx.hasNull, selected, ignoreNull)
 		if err != nil {
 			joinResult.err = err
 			return false, joinResult
@@ -654,9 +643,18 @@ func (e *HashJoinExec) fetchAndBuildHashTable(ctx context.Context) {
 	// buildSideResultCh transfers build side chunk from build side fetch to build hash table.
 	buildSideResultCh := make(chan *chunk.Chunk, 1)
 	doneCh := make(chan struct{})
-	go util.WithRecovery(func() { e.fetchBuildSideRows(ctx, buildSideResultCh, doneCh) }, nil)
+	fetchBuildSideRowsOk := make(chan error, 1)
+	go util.WithRecovery(
+		func() { e.fetchBuildSideRows(ctx, buildSideResultCh, doneCh) },
+		func(r interface{}) {
+			if r != nil {
+				fetchBuildSideRowsOk <- errors.Errorf("%v", r)
+			}
+			close(fetchBuildSideRowsOk)
+		},
+	)
 
-	// TODO: Parallel build hash table. Currently not support because `rowHashMap` is not thread-safe.
+	// TODO: Parallel build hash table. Currently not support because `unsafeHashTable` is not thread-safe.
 	err := e.buildHashTableForList(buildSideResultCh)
 	if err != nil {
 		e.buildFinished <- errors.Trace(err)
@@ -667,6 +665,12 @@ func (e *HashJoinExec) fetchAndBuildHashTable(ctx context.Context) {
 	// 2. if probeSideResult.NumRows() == 0, fetchProbeSideChunks will not wait for the build side.
 	for range buildSideResultCh {
 	}
+	// Check whether err is nil to avoid sending redundant error into buildFinished.
+	if err == nil {
+		if err = <-fetchBuildSideRowsOk; err != nil {
+			e.buildFinished <- err
+		}
+	}
 }
 
 // buildHashTableForList builds hash table from `list`.
@@ -675,9 +679,8 @@ func (e *HashJoinExec) buildHashTableForList(buildSideResultCh <-chan *chunk.Chu
 	for i := range e.buildKeys {
 		buildKeyColIdx[i] = e.buildKeys[i].Index
 	}
-	allTypes := e.buildSideExec.base().retFieldTypes
 	hCtx := &hashContext{
-		allTypes:  allTypes,
+		allTypes:  e.buildTypes,
 		keyColIdx: buildKeyColIdx,
 	}
 	var err error
@@ -689,6 +692,12 @@ func (e *HashJoinExec) buildHashTableForList(buildSideResultCh <-chan *chunk.Chu
 	e.rowContainer.GetDiskTracker().SetLabel(buildSideResultLabel)
 	if config.GetGlobalConfig().OOMUseTmpStorage {
 		actionSpill := e.rowContainer.ActionSpill()
+		failpoint.Inject("testRowContainerSpill", func(val failpoint.Value) {
+			if val.(bool) {
+				actionSpill = e.rowContainer.rowContainer.ActionSpillForTest()
+				defer actionSpill.(*chunk.SpillDiskAction).WaitForTest()
+			}
+		})
 		e.ctx.GetSessionVars().StmtCtx.MemTracker.FallbackOldAndSetNewAction(actionSpill)
 	}
 	for chk := range buildSideResultCh {
@@ -696,19 +705,19 @@ func (e *HashJoinExec) buildHashTableForList(buildSideResultCh <-chan *chunk.Chu
 			return nil
 		}
 		if !e.useOuterToBuild {
-			err = e.rowContainer.PutChunk(chk)
+			err = e.rowContainer.PutChunk(chk, e.isNullEQ)
 		} else {
 			var bitMap = bitmap.NewConcurrentBitmap(chk.NumRows())
 			e.outerMatchedStatus = append(e.outerMatchedStatus, bitMap)
 			e.memTracker.Consume(bitMap.BytesConsumed())
 			if len(e.outerFilter) == 0 {
-				err = e.rowContainer.PutChunk(chk)
+				err = e.rowContainer.PutChunk(chk, e.isNullEQ)
 			} else {
 				selected, err = expression.VectorizedFilter(e.ctx, e.outerFilter, chunk.NewIterator4Chunk(chk), selected)
 				if err != nil {
 					return err
 				}
-				err = e.rowContainer.PutChunkSelected(chk, selected)
+				err = e.rowContainer.PutChunkSelected(chk, selected, e.isNullEQ)
 			}
 		}
 		if err != nil {
@@ -722,6 +731,7 @@ func (e *HashJoinExec) buildHashTableForList(buildSideResultCh <-chan *chunk.Chu
 type NestedLoopApplyExec struct {
 	baseExecutor
 
+	ctx         sessionctx.Context
 	innerRows   []chunk.Row
 	cursor      int
 	innerExec   Executor
@@ -730,6 +740,11 @@ type NestedLoopApplyExec struct {
 	outerFilter expression.CNFExprs
 
 	joiner joiner
+
+	cache              *applyCache
+	canUseCache        bool
+	cacheHitCounter    int
+	cacheAccessCounter int
 
 	outerSchema []*expression.CorrelatedColumn
 
@@ -752,8 +767,20 @@ type NestedLoopApplyExec struct {
 // Close implements the Executor interface.
 func (e *NestedLoopApplyExec) Close() error {
 	e.innerRows = nil
-
 	e.memTracker = nil
+	if e.runtimeStats != nil {
+		runtimeStats := newJoinRuntimeStats(e.runtimeStats)
+		e.ctx.GetSessionVars().StmtCtx.RuntimeStatsColl.RegisterStats(e.id.String(), runtimeStats)
+		if e.canUseCache {
+			var hitRatio float64
+			if e.cacheAccessCounter > 0 {
+				hitRatio = float64(e.cacheHitCounter) / float64(e.cacheAccessCounter)
+			}
+			runtimeStats.setCacheInfo(true, hitRatio)
+		} else {
+			runtimeStats.setCacheInfo(false, 0)
+		}
+	}
 	return e.outerExec.Close()
 }
 
@@ -771,12 +798,21 @@ func (e *NestedLoopApplyExec) Open(ctx context.Context) error {
 	e.innerChunk = newFirstChunk(e.innerExec)
 	e.innerList = chunk.NewList(retTypes(e.innerExec), e.initCap, e.maxChunkSize)
 
-	e.memTracker = memory.NewTracker(e.id, e.ctx.GetSessionVars().MemQuotaNestedLoopApply)
+	e.memTracker = memory.NewTracker(e.id, -1)
 	e.memTracker.AttachTo(e.ctx.GetSessionVars().StmtCtx.MemTracker)
 
 	e.innerList.GetMemTracker().SetLabel(innerListLabel)
 	e.innerList.GetMemTracker().AttachTo(e.memTracker)
 
+	if e.canUseCache {
+		e.cache, err = newApplyCache(e.ctx)
+		if err != nil {
+			return err
+		}
+		e.cacheHitCounter = 0
+		e.cacheAccessCounter = 0
+		e.cache.GetMemTracker().AttachTo(e.memTracker)
+	}
 	return nil
 }
 
@@ -818,7 +854,13 @@ func (e *NestedLoopApplyExec) fetchAllInners(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	e.innerList.Reset()
+
+	if e.canUseCache {
+		// create a new one since it may be in the cache
+		e.innerList = chunk.NewList(retTypes(e.innerExec), e.initCap, e.maxChunkSize)
+	} else {
+		e.innerList.Reset()
+	}
 	innerIter := chunk.NewIterator4Chunk(e.innerChunk)
 	for {
 		err := Next(ctx, e.innerExec, e.innerChunk)
@@ -856,12 +898,40 @@ func (e *NestedLoopApplyExec) Next(ctx context.Context, req *chunk.Chunk) (err e
 			e.hasMatch = false
 			e.hasNull = false
 
-			for _, col := range e.outerSchema {
-				*col.Data = e.outerRow.GetDatum(col.Index, col.RetType)
-			}
-			err = e.fetchAllInners(ctx)
-			if err != nil {
-				return err
+			if e.canUseCache {
+				var key []byte
+				for _, col := range e.outerSchema {
+					*col.Data = e.outerRow.GetDatum(col.Index, col.RetType)
+					key, err = codec.EncodeKey(e.ctx.GetSessionVars().StmtCtx, key, *col.Data)
+					if err != nil {
+						return err
+					}
+				}
+				e.cacheAccessCounter++
+				value, err := e.cache.Get(key)
+				if err != nil {
+					return err
+				}
+				if value != nil {
+					e.innerList = value
+					e.cacheHitCounter++
+				} else {
+					err = e.fetchAllInners(ctx)
+					if err != nil {
+						return err
+					}
+					if _, err := e.cache.Set(key, e.innerList); err != nil {
+						return err
+					}
+				}
+			} else {
+				for _, col := range e.outerSchema {
+					*col.Data = e.outerRow.GetDatum(col.Index, col.RetType)
+				}
+				err = e.fetchAllInners(ctx)
+				if err != nil {
+					return err
+				}
 			}
 			e.innerIter = chunk.NewIterator4List(e.innerList)
 			e.innerIter.Begin()
@@ -875,4 +945,59 @@ func (e *NestedLoopApplyExec) Next(ctx context.Context, req *chunk.Chunk) (err e
 			return err
 		}
 	}
+}
+
+// cacheInfo is used to save the concurrency information of the executor operator
+type cacheInfo struct {
+	hitRatio float64
+	useCache bool
+}
+
+type joinRuntimeStats struct {
+	*execdetails.RuntimeStatsWithConcurrencyInfo
+
+	applyCache  bool
+	cache       cacheInfo
+	hasHashStat bool
+	hashStat    hashStatistic
+}
+
+func newJoinRuntimeStats(basic *execdetails.BasicRuntimeStats) *joinRuntimeStats {
+	stats := &joinRuntimeStats{
+		RuntimeStatsWithConcurrencyInfo: &execdetails.RuntimeStatsWithConcurrencyInfo{
+			BasicRuntimeStats: basic,
+		},
+	}
+	return stats
+}
+
+// setCacheInfo sets the cache information. Only used for apply executor.
+func (e *joinRuntimeStats) setCacheInfo(useCache bool, hitRatio float64) {
+	e.Lock()
+	e.applyCache = true
+	e.cache.useCache = useCache
+	e.cache.hitRatio = hitRatio
+	e.Unlock()
+}
+
+func (e *joinRuntimeStats) setHashStat(hashStat hashStatistic) {
+	e.Lock()
+	e.hasHashStat = true
+	e.hashStat = hashStat
+	e.Unlock()
+}
+
+func (e *joinRuntimeStats) String() string {
+	result := e.RuntimeStatsWithConcurrencyInfo.String()
+	if e.applyCache {
+		if e.cache.useCache {
+			result += fmt.Sprintf(", cache:ON, cacheHitRatio:%.3f%%", e.cache.hitRatio*100)
+		} else {
+			result += fmt.Sprintf(", cache:OFF")
+		}
+	}
+	if e.hasHashStat {
+		result += ", " + e.hashStat.String()
+	}
+	return result
 }

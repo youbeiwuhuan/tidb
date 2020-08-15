@@ -18,7 +18,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/types/json"
@@ -810,7 +809,16 @@ func (b *builtinCastRealAsDecimalSig) vecEvalDecimal(input *chunk.Chunk, result 
 	for i := 0; i < n; i++ {
 		if !b.inUnion || bufreal[i] >= 0 {
 			if err = resdecimal[i].FromFloat64(bufreal[i]); err != nil {
-				return err
+				if types.ErrOverflow.Equal(err) {
+					warnErr := types.ErrTruncatedWrongVal.GenWithStackByArgs("DECIMAL", b.args[0])
+					err = b.ctx.GetSessionVars().StmtCtx.HandleOverflow(err, warnErr)
+				} else if types.ErrTruncated.Equal(err) {
+					// This behavior is consistent with MySQL.
+					err = nil
+				}
+				if err != nil {
+					return err
+				}
 			}
 		}
 		dec, err := types.ProduceDecWithSpecifiedTp(&resdecimal[i], b.tp, b.ctx.GetSessionVars().StmtCtx)
@@ -856,7 +864,7 @@ func (b *builtinCastStringAsIntSig) vecEvalInt(input *chunk.Chunk, result *chunk
 		val := strings.TrimSpace(buf.GetString(i))
 		isNegative := len(val) > 1 && val[0] == '-'
 		if !isNegative {
-			ures, err = types.StrToUint(sc, val)
+			ures, err = types.StrToUint(sc, val, true)
 			if !isUnsigned && err == nil && ures > uint64(math.MaxInt64) {
 				sc.AppendWarning(types.ErrCastAsSignedOverflow)
 			}
@@ -864,7 +872,7 @@ func (b *builtinCastStringAsIntSig) vecEvalInt(input *chunk.Chunk, result *chunk
 		} else if unionUnsigned {
 			res = 0
 		} else {
-			res, err = types.StrToInt(sc, val)
+			res, err = types.StrToInt(sc, val, true)
 			if err == nil && isUnsigned {
 				// If overflow, don't append this warnings
 				sc.AppendWarning(types.ErrCastNegIntAsUnsigned)
@@ -880,11 +888,42 @@ func (b *builtinCastStringAsIntSig) vecEvalInt(input *chunk.Chunk, result *chunk
 }
 
 func (b *builtinCastStringAsDurationSig) vectorized() bool {
-	return false
+	return true
 }
 
 func (b *builtinCastStringAsDurationSig) vecEvalDuration(input *chunk.Chunk, result *chunk.Column) error {
-	return errors.Errorf("not implemented")
+	n := input.NumRows()
+	buf, err := b.bufAllocator.get(types.ETString, n)
+	if err != nil {
+		return err
+	}
+	defer b.bufAllocator.put(buf)
+	if err := b.args[0].VecEvalString(b.ctx, input, buf); err != nil {
+		return err
+	}
+	result.ResizeGoDuration(n, false)
+	result.MergeNulls(buf)
+	ds := result.GoDurations()
+	for i := 0; i < n; i++ {
+		if result.IsNull(i) {
+			continue
+		}
+		dur, err := types.ParseDuration(b.ctx.GetSessionVars().StmtCtx, buf.GetString(i), int8(b.tp.Decimal))
+		if err != nil {
+			if types.ErrTruncatedWrongVal.Equal(err) {
+				err = b.ctx.GetSessionVars().StmtCtx.HandleTruncate(err)
+			}
+			if err != nil {
+				return err
+			}
+			if dur == types.ZeroDuration {
+				result.SetNull(i, true)
+				continue
+			}
+		}
+		ds[i] = dur.Duration
+	}
+	return nil
 }
 
 func (b *builtinCastDurationAsDecimalSig) vectorized() bool {
@@ -1524,7 +1563,7 @@ func (b *builtinCastStringAsRealSig) vecEvalReal(input *chunk.Chunk, result *chu
 		if result.IsNull(i) {
 			continue
 		}
-		res, err := types.StrToFloat(sc, buf.GetString(i))
+		res, err := types.StrToFloat(sc, buf.GetString(i), true)
 		if err != nil {
 			return err
 		}
@@ -1565,9 +1604,11 @@ func (b *builtinCastStringAsDecimalSig) vecEvalDecimal(input *chunk.Chunk, resul
 		if result.IsNull(i) {
 			continue
 		}
+		val := strings.TrimSpace(buf.GetString(i))
+		isNegative := len(val) > 0 && val[0] == '-'
 		dec := new(types.MyDecimal)
-		if !(b.inUnion && mysql.HasUnsignedFlag(b.tp.Flag) && dec.IsNegative()) {
-			if err := stmtCtx.HandleTruncate(dec.FromString([]byte(buf.GetString(i)))); err != nil {
+		if !(b.inUnion && mysql.HasUnsignedFlag(b.tp.Flag) && isNegative) {
+			if err := stmtCtx.HandleTruncate(dec.FromString([]byte(val))); err != nil {
 				return err
 			}
 			dec, err := types.ProduceDecWithSpecifiedTp(dec, b.tp, stmtCtx)

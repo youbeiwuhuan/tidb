@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/parser/auth"
@@ -38,6 +39,7 @@ func TestT(t *testing.T) {
 	logLevel := os.Getenv("log_level")
 	logutil.InitLogger(logutil.NewLogConfig(logLevel, logutil.DefaultLogFormat, "", logutil.EmptyFileLogConfig, false))
 	CustomVerboseFlag = true
+	SetSchemaLease(20 * time.Millisecond)
 	TestingT(t)
 }
 
@@ -102,13 +104,13 @@ func (s *testMainSuite) TestParseErrorWarn(c *C) {
 }
 
 func newStore(c *C, dbPath string) kv.Storage {
-	store, err := mockstore.NewMockTikvStore()
+	store, err := mockstore.NewMockStore()
 	c.Assert(err, IsNil)
 	return store
 }
 
 func newStoreWithBootstrap(c *C, dbPath string) (kv.Storage, *domain.Domain) {
-	store, err := mockstore.NewMockTikvStore()
+	store, err := mockstore.NewMockStore()
 	c.Assert(err, IsNil)
 	dom, err := BootstrapSession(store)
 	c.Assert(err, IsNil)
@@ -172,7 +174,7 @@ func match(c *C, row []types.Datum, expected ...interface{}) {
 }
 
 func (s *testMainSuite) TestKeysNeedLock(c *C) {
-	rowKey := tablecodec.EncodeRowKeyWithHandle(1, 1)
+	rowKey := tablecodec.EncodeRowKeyWithHandle(1, kv.IntHandle(1))
 	indexKey := tablecodec.EncodeIndexSeekKey(1, 1, []byte{1})
 	uniqueValue := make([]byte, 8)
 	uniqueUntouched := append(uniqueValue, '1')
@@ -194,6 +196,9 @@ func (s *testMainSuite) TestKeysNeedLock(c *C) {
 		{indexKey, deleteVal, false},
 	}
 	for _, tt := range tests {
-		c.Assert(keyNeedToLock(tt.key, tt.val), Equals, tt.need)
+		c.Assert(keyNeedToLock(tt.key, tt.val, 0), Equals, tt.need)
 	}
+	flag := kv.KeyFlags(1)
+	c.Assert(flag.HasPresumeKeyNotExists(), IsTrue)
+	c.Assert(keyNeedToLock(indexKey, deleteVal, flag), IsTrue)
 }

@@ -81,15 +81,35 @@ func (la *LogicalApply) deCorColFromEqExpr(expr expression.Expression) expressio
 	return nil
 }
 
+// ExtractCorrelatedCols4LogicalPlan recursively extracts all of the correlated columns
+// from a plan tree by calling LogicalPlan.ExtractCorrelatedCols.
+func ExtractCorrelatedCols4LogicalPlan(p LogicalPlan) []*expression.CorrelatedColumn {
+	corCols := p.ExtractCorrelatedCols()
+	for _, child := range p.Children() {
+		corCols = append(corCols, ExtractCorrelatedCols4LogicalPlan(child)...)
+	}
+	return corCols
+}
+
+// ExtractCorrelatedCols4PhysicalPlan recursively extracts all of the correlated columns
+// from a plan tree by calling PhysicalPlan.ExtractCorrelatedCols.
+func ExtractCorrelatedCols4PhysicalPlan(p PhysicalPlan) []*expression.CorrelatedColumn {
+	corCols := p.ExtractCorrelatedCols()
+	for _, child := range p.Children() {
+		corCols = append(corCols, ExtractCorrelatedCols4PhysicalPlan(child)...)
+	}
+	return corCols
+}
+
 // decorrelateSolver tries to convert apply plan to join plan.
 type decorrelateSolver struct{}
 
 func (s *decorrelateSolver) aggDefaultValueMap(agg *LogicalAggregation) map[int]*expression.Constant {
-	defaultValueMap := make(map[int]*expression.Constant)
+	defaultValueMap := make(map[int]*expression.Constant, len(agg.AggFuncs))
 	for i, f := range agg.AggFuncs {
 		switch f.Name {
 		case ast.AggFuncBitOr, ast.AggFuncBitXor, ast.AggFuncCount:
-			defaultValueMap[i] = expression.Zero.Clone().(*expression.Constant)
+			defaultValueMap[i] = expression.NewZero()
 		case ast.AggFuncBitAnd:
 			defaultValueMap[i] = &expression.Constant{Value: types.NewUintDatum(math.MaxUint64), RetType: types.NewFieldType(mysql.TypeLonglong)}
 		}
@@ -102,7 +122,7 @@ func (s *decorrelateSolver) optimize(ctx context.Context, p LogicalPlan) (Logica
 	if apply, ok := p.(*LogicalApply); ok {
 		outerPlan := apply.children[0]
 		innerPlan := apply.children[1]
-		apply.CorCols = extractCorColumnsBySchema(apply.children[1], apply.children[0].Schema())
+		apply.CorCols = extractCorColumnsBySchema4LogicalPlan(apply.children[1], apply.children[0].Schema())
 		if len(apply.CorCols) == 0 {
 			// If the inner plan is non-correlated, the apply will be simplified to join.
 			join := &apply.LogicalJoin
@@ -196,7 +216,7 @@ func (s *decorrelateSolver) optimize(ctx context.Context, p LogicalPlan) (Logica
 				if len(eqCondWithCorCol) > 0 {
 					originalExpr := sel.Conditions
 					sel.Conditions = remainedExpr
-					apply.CorCols = extractCorColumnsBySchema(apply.children[1], apply.children[0].Schema())
+					apply.CorCols = extractCorColumnsBySchema4LogicalPlan(apply.children[1], apply.children[0].Schema())
 					// There's no other correlated column.
 					groupByCols := expression.NewSchema(agg.groupByCols...)
 					if len(apply.CorCols) == 0 {
@@ -242,7 +262,7 @@ func (s *decorrelateSolver) optimize(ctx context.Context, p LogicalPlan) (Logica
 						return s.optimize(ctx, p)
 					}
 					sel.Conditions = originalExpr
-					apply.CorCols = extractCorColumnsBySchema(apply.children[1], apply.children[0].Schema())
+					apply.CorCols = extractCorColumnsBySchema4LogicalPlan(apply.children[1], apply.children[0].Schema())
 				}
 			}
 		} else if sort, ok := innerPlan.(*LogicalSort); ok {

@@ -29,7 +29,7 @@ import (
 	"github.com/pingcap/tidb/meta/autoid"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/types"
-	"github.com/pingcap/tidb/types/parser_driver"
+	driver "github.com/pingcap/tidb/types/parser_driver"
 	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/domainutil"
 )
@@ -45,6 +45,36 @@ func InPrepare(p *preprocessor) {
 // InTxnRetry is a PreprocessOpt that indicates preprocess is executing under transaction retry.
 func InTxnRetry(p *preprocessor) {
 	p.flag |= inTxnRetry
+}
+
+// TryAddExtraLimit trys to add an extra limit for SELECT or UNION statement when sql_select_limit is set.
+func TryAddExtraLimit(ctx sessionctx.Context, node ast.StmtNode) ast.StmtNode {
+	if ctx.GetSessionVars().SelectLimit == math.MaxUint64 || ctx.GetSessionVars().InRestrictedSQL {
+		return node
+	}
+	if explain, ok := node.(*ast.ExplainStmt); ok {
+		explain.Stmt = TryAddExtraLimit(ctx, explain.Stmt)
+		return explain
+	} else if sel, ok := node.(*ast.SelectStmt); ok {
+		if sel.Limit != nil || sel.SelectIntoOpt != nil {
+			return node
+		}
+		newSel := *sel
+		newSel.Limit = &ast.Limit{
+			Count: ast.NewValueExpr(ctx.GetSessionVars().SelectLimit, "", ""),
+		}
+		return &newSel
+	} else if setOprStmt, ok := node.(*ast.SetOprStmt); ok {
+		if setOprStmt.Limit != nil {
+			return node
+		}
+		newSetOpr := *setOprStmt
+		newSetOpr.Limit = &ast.Limit{
+			Count: ast.NewValueExpr(ctx.GetSessionVars().SelectLimit, "", ""),
+		}
+		return &newSetOpr
+	}
+	return node
 }
 
 // Preprocess resolves table names of the node, and checks some statements validation.
@@ -70,6 +100,9 @@ const (
 	parentIsJoin
 	// inRepairTable is set when visiting a repair table statement.
 	inRepairTable
+	// inSequenceFunction is set when visiting a sequence function.
+	// This flag indicates the tableName in these function should be checked as sequence object.
+	inSequenceFunction
 )
 
 // preprocessor is an ast.Visitor that preprocess
@@ -94,6 +127,7 @@ func (p *preprocessor) Enter(in ast.Node) (out ast.Node, skipChildren bool) {
 	case *ast.CreateViewStmt:
 		p.flag |= inCreateOrDropTable
 		p.checkCreateViewGrammar(node)
+		p.checkCreateViewWithSelectGrammar(node)
 	case *ast.DropTableStmt:
 		p.flag |= inCreateOrDropTable
 		p.checkDropTableGrammar(node)
@@ -113,8 +147,8 @@ func (p *preprocessor) Enter(in ast.Node) (out ast.Node, skipChildren bool) {
 		p.checkDropDatabaseGrammar(node)
 	case *ast.ShowStmt:
 		p.resolveShowStmt(node)
-	case *ast.UnionSelectList:
-		p.checkUnionSelectList(node)
+	case *ast.SetOprSelectList:
+		p.checkSetOprSelectList(node)
 	case *ast.DeleteTableList:
 		return in, true
 	case *ast.Join:
@@ -143,6 +177,19 @@ func (p *preprocessor) Enter(in ast.Node) (out ast.Node, skipChildren bool) {
 	case *ast.CreateSequenceStmt:
 		p.flag |= inCreateOrDropTable
 		p.resolveCreateSequenceStmt(node)
+	case *ast.DropSequenceStmt:
+		p.flag |= inCreateOrDropTable
+		p.checkDropSequenceGrammar(node)
+	case *ast.FuncCallExpr:
+		if node.FnName.L == ast.NextVal || node.FnName.L == ast.LastVal || node.FnName.L == ast.SetVal {
+			p.flag |= inSequenceFunction
+		}
+	case *ast.BRIEStmt:
+		if node.Kind == ast.BRIEKindRestore {
+			p.flag |= inCreateOrDropTable
+		}
+	case *ast.CreateStatisticsStmt, *ast.DropStatisticsStmt:
+		p.checkStatisticsOpGrammar(in)
 	default:
 		p.flag &= ^parentIsJoin
 	}
@@ -225,27 +272,35 @@ func (p *preprocessor) Leave(in ast.Node) (out ast.Node, ok bool) {
 		// no need sleep when retry transaction and avoid unexpect sleep caused by retry.
 		if p.flag&inTxnRetry > 0 && x.FnName.L == ast.Sleep {
 			if len(x.Args) == 1 {
-				x.Args[0] = ast.NewValueExpr(0)
+				x.Args[0] = ast.NewValueExpr(0, "", "")
 			}
+		}
+
+		if x.FnName.L == ast.NextVal || x.FnName.L == ast.LastVal || x.FnName.L == ast.SetVal {
+			p.flag &= ^inSequenceFunction
 		}
 	case *ast.RepairTableStmt:
 		p.flag &= ^inRepairTable
 	case *ast.CreateSequenceStmt:
 		p.flag &= ^inCreateOrDropTable
+	case *ast.BRIEStmt:
+		if x.Kind == ast.BRIEKindRestore {
+			p.flag &= ^inCreateOrDropTable
+		}
 	}
 
 	return in, p.err == nil
 }
 
-func checkAutoIncrementOp(colDef *ast.ColumnDef, num int) (bool, error) {
+func checkAutoIncrementOp(colDef *ast.ColumnDef, index int) (bool, error) {
 	var hasAutoIncrement bool
 
-	if colDef.Options[num].Tp == ast.ColumnOptionAutoIncrement {
+	if colDef.Options[index].Tp == ast.ColumnOptionAutoIncrement {
 		hasAutoIncrement = true
-		if len(colDef.Options) == num+1 {
+		if len(colDef.Options) == index+1 {
 			return hasAutoIncrement, nil
 		}
-		for _, op := range colDef.Options[num+1:] {
+		for _, op := range colDef.Options[index+1:] {
 			if op.Tp == ast.ColumnOptionDefaultValue {
 				if tmp, ok := op.Expr.(*driver.ValueExpr); ok {
 					if !tmp.Datum.IsNull() {
@@ -255,13 +310,13 @@ func checkAutoIncrementOp(colDef *ast.ColumnDef, num int) (bool, error) {
 			}
 		}
 	}
-	if colDef.Options[num].Tp == ast.ColumnOptionDefaultValue && len(colDef.Options) != num+1 {
-		if tmp, ok := colDef.Options[num].Expr.(*driver.ValueExpr); ok {
+	if colDef.Options[index].Tp == ast.ColumnOptionDefaultValue && len(colDef.Options) != index+1 {
+		if tmp, ok := colDef.Options[index].Expr.(*driver.ValueExpr); ok {
 			if tmp.Datum.IsNull() {
 				return hasAutoIncrement, nil
 			}
 		}
-		for _, op := range colDef.Options[num+1:] {
+		for _, op := range colDef.Options[index+1:] {
 			if op.Tp == ast.ColumnOptionAutoIncrement {
 				return hasAutoIncrement, errors.Errorf("Invalid default value for '%s'", colDef.Name.Name.O)
 			}
@@ -289,14 +344,11 @@ func isConstraintKeyTp(constraints []*ast.Constraint, colDef *ast.ColumnDef) boo
 }
 
 func (p *preprocessor) checkAutoIncrement(stmt *ast.CreateTableStmt) {
-	var (
-		isKey            bool
-		count            int
-		autoIncrementCol *ast.ColumnDef
-	)
+	autoIncrementCols := make(map[*ast.ColumnDef]bool)
 
 	for _, colDef := range stmt.Cols {
 		var hasAutoIncrement bool
+		var isKey bool
 		for i, op := range colDef.Options {
 			ok, err := checkAutoIncrementOp(colDef, i)
 			if err != nil {
@@ -312,39 +364,47 @@ func (p *preprocessor) checkAutoIncrement(stmt *ast.CreateTableStmt) {
 			}
 		}
 		if hasAutoIncrement {
-			count++
-			autoIncrementCol = colDef
+			autoIncrementCols[colDef] = isKey
 		}
 	}
 
-	if count < 1 {
+	if len(autoIncrementCols) < 1 {
 		return
 	}
-	if !isKey {
-		isKey = isConstraintKeyTp(stmt.Constraints, autoIncrementCol)
+	if len(autoIncrementCols) > 1 {
+		p.err = autoid.ErrWrongAutoKey.GenWithStackByArgs()
+		return
 	}
-	autoIncrementMustBeKey := true
-	for _, opt := range stmt.Options {
-		if opt.Tp == ast.TableOptionEngine && strings.EqualFold(opt.StrValue, "MyISAM") {
-			autoIncrementMustBeKey = false
+	// Only have one auto_increment col.
+	for col, isKey := range autoIncrementCols {
+		if !isKey {
+			isKey = isConstraintKeyTp(stmt.Constraints, col)
+		}
+		autoIncrementMustBeKey := true
+		for _, opt := range stmt.Options {
+			if opt.Tp == ast.TableOptionEngine && strings.EqualFold(opt.StrValue, "MyISAM") {
+				autoIncrementMustBeKey = false
+			}
+		}
+		if autoIncrementMustBeKey && !isKey {
+			p.err = autoid.ErrWrongAutoKey.GenWithStackByArgs()
+		}
+		switch col.Tp.Tp {
+		case mysql.TypeTiny, mysql.TypeShort, mysql.TypeLong,
+			mysql.TypeFloat, mysql.TypeDouble, mysql.TypeLonglong, mysql.TypeInt24:
+		default:
+			p.err = errors.Errorf("Incorrect column specifier for column '%s'", col.Name.Name.O)
 		}
 	}
-	if (autoIncrementMustBeKey && !isKey) || count > 1 {
-		p.err = autoid.ErrWrongAutoKey.GenWithStackByArgs()
-	}
 
-	switch autoIncrementCol.Tp.Tp {
-	case mysql.TypeTiny, mysql.TypeShort, mysql.TypeLong,
-		mysql.TypeFloat, mysql.TypeDouble, mysql.TypeLonglong, mysql.TypeInt24:
-	default:
-		p.err = errors.Errorf("Incorrect column specifier for column '%s'", autoIncrementCol.Name.Name.O)
-	}
 }
 
-// checkUnionSelectList checks union's selectList.
+// checkSetOprSelectList checks union's selectList.
 // refer: https://dev.mysql.com/doc/refman/5.7/en/union.html
+//        https://mariadb.com/kb/en/intersect/
+//        https://mariadb.com/kb/en/except/
 // "To apply ORDER BY or LIMIT to an individual SELECT, place the clause inside the parentheses that enclose the SELECT."
-func (p *preprocessor) checkUnionSelectList(stmt *ast.UnionSelectList) {
+func (p *preprocessor) checkSetOprSelectList(stmt *ast.SetOprSelectList) {
 	for _, sel := range stmt.Selects[:len(stmt.Selects)-1] {
 		if sel.IsInBraces {
 			continue
@@ -429,6 +489,9 @@ func (p *preprocessor) checkCreateTableGrammar(stmt *ast.CreateTableStmt) {
 			}
 		}
 	}
+	if p.err = checkUnsupportedTableOptions(stmt.Options); p.err != nil {
+		return
+	}
 	if stmt.Select != nil {
 		// FIXME: a temp error noticing 'not implemented' (issue 4754)
 		p.err = errors.New("'CREATE TABLE ... SELECT' is not implemented yet")
@@ -453,8 +516,41 @@ func (p *preprocessor) checkCreateViewGrammar(stmt *ast.CreateViewStmt) {
 	}
 }
 
+func (p *preprocessor) checkCreateViewWithSelect(stmt *ast.SelectStmt) {
+	if stmt.SelectIntoOpt != nil {
+		p.err = ddl.ErrViewSelectClause.GenWithStackByArgs("INFO")
+		return
+	}
+	if stmt.LockTp != ast.SelectLockNone {
+		stmt.LockTp = ast.SelectLockNone
+		return
+	}
+}
+
+func (p *preprocessor) checkCreateViewWithSelectGrammar(stmt *ast.CreateViewStmt) {
+	switch stmt := stmt.Select.(type) {
+	case *ast.SelectStmt:
+		p.checkCreateViewWithSelect(stmt)
+	case *ast.SetOprStmt:
+		for _, selectStmt := range stmt.SelectList.Selects {
+			p.checkCreateViewWithSelect(selectStmt)
+			if p.err != nil {
+				return
+			}
+		}
+	}
+}
+
+func (p *preprocessor) checkDropSequenceGrammar(stmt *ast.DropSequenceStmt) {
+	p.checkDropTableNames(stmt.Sequences)
+}
+
 func (p *preprocessor) checkDropTableGrammar(stmt *ast.DropTableStmt) {
-	for _, t := range stmt.Tables {
+	p.checkDropTableNames(stmt.Tables)
+}
+
+func (p *preprocessor) checkDropTableNames(tables []*ast.TableName) {
+	for _, t := range tables {
 		if isIncorrectName(t.Name.String()) {
 			p.err = ddl.ErrWrongTableName.GenWithStackByArgs(t.Name.String())
 			return
@@ -528,6 +624,21 @@ func (p *preprocessor) checkCreateIndexGrammar(stmt *ast.CreateIndexStmt) {
 	p.err = checkIndexInfo(stmt.IndexName, stmt.IndexPartSpecifications)
 }
 
+func (p *preprocessor) checkStatisticsOpGrammar(node ast.Node) {
+	var statsName string
+	switch stmt := node.(type) {
+	case *ast.CreateStatisticsStmt:
+		statsName = stmt.StatsName
+	case *ast.DropStatisticsStmt:
+		statsName = stmt.StatsName
+	}
+	if isIncorrectName(statsName) {
+		msg := fmt.Sprintf("Incorrect statistics name: %s", statsName)
+		p.err = ErrInternal.GenWithStack(msg)
+	}
+	return
+}
+
 func (p *preprocessor) checkRenameTableGrammar(stmt *ast.RenameTableStmt) {
 	oldTable := stmt.OldTable.Name.String()
 	newTable := stmt.NewTable.Name.String()
@@ -584,6 +695,9 @@ func (p *preprocessor) checkAlterTableGrammar(stmt *ast.AlterTableStmt) {
 				return
 			}
 		}
+		if p.err = checkUnsupportedTableOptions(spec.Options); p.err != nil {
+			return
+		}
 		switch spec.Tp {
 		case ast.AlterTableAddConstraint:
 			switch spec.Constraint.Tp {
@@ -626,6 +740,19 @@ func checkIndexInfo(indexName string, IndexPartSpecifications []*ast.IndexPartSp
 		return infoschema.ErrTooManyKeyParts.GenWithStackByArgs(mysql.MaxKeyParts)
 	}
 	return checkDuplicateColumnName(IndexPartSpecifications)
+}
+
+// checkUnsupportedTableOptions checks if there exists unsupported table options
+func checkUnsupportedTableOptions(options []*ast.TableOption) error {
+	for _, option := range options {
+		switch option.Tp {
+		case ast.TableOptionUnion:
+			return ddl.ErrTableOptionUnionUnsupported
+		case ast.TableOptionInsertMethod:
+			return ddl.ErrTableOptionInsertMethodUnsupported
+		}
+	}
+	return nil
 }
 
 // checkColumn checks if the column definition is valid.
@@ -795,8 +922,16 @@ func (p *preprocessor) handleTableName(tn *ast.TableName) {
 		p.err = err
 		return
 	}
-	tn.TableInfo = table.Meta()
+	tableInfo := table.Meta()
 	dbInfo, _ := p.is.SchemaByName(tn.Schema)
+	// tableName should be checked as sequence object.
+	if p.flag&inSequenceFunction > 0 {
+		if !tableInfo.IsSequence() {
+			p.err = infoschema.ErrWrongObject.GenWithStackByArgs(dbInfo.Name.O, tableInfo.Name.O, "SEQUENCE")
+			return
+		}
+	}
+	tn.TableInfo = tableInfo
 	tn.DBInfo = dbInfo
 }
 

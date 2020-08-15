@@ -25,7 +25,7 @@ import (
 	"github.com/pingcap/tidb/util/testkit"
 )
 
-func (s *testSuite1) TestExplainPriviliges(c *C) {
+func (s *testSuite1) TestExplainPrivileges(c *C) {
 	se, err := session.CreateSession4Test(s.store)
 	c.Assert(err, IsNil)
 	c.Assert(se.Auth(&auth.UserIdentity{Username: "root", Hostname: "%"}, nil, nil), IsTrue)
@@ -37,7 +37,6 @@ func (s *testSuite1) TestExplainPriviliges(c *C) {
 	tk.MustExec("create table t (id int)")
 	tk.MustExec("create view v as select * from t")
 	tk.MustExec(`create user 'explain'@'%'`)
-	tk.MustExec(`flush privileges`)
 
 	tk1 := testkit.NewTestKit(c, s.store)
 	se, err = session.CreateSession4Test(s.store)
@@ -46,7 +45,6 @@ func (s *testSuite1) TestExplainPriviliges(c *C) {
 	tk1.Se = se
 
 	tk.MustExec(`grant select on explaindatabase.v to 'explain'@'%'`)
-	tk.MustExec(`flush privileges`)
 	tk1.MustQuery("show databases").Check(testkit.Rows("INFORMATION_SCHEMA", "explaindatabase"))
 
 	tk1.MustExec("use explaindatabase")
@@ -55,11 +53,9 @@ func (s *testSuite1) TestExplainPriviliges(c *C) {
 	c.Assert(err.Error(), Equals, plannercore.ErrViewNoExplain.Error())
 
 	tk.MustExec(`grant show view on explaindatabase.v to 'explain'@'%'`)
-	tk.MustExec(`flush privileges`)
 	tk1.MustQuery("explain select * from v")
 
 	tk.MustExec(`revoke select on explaindatabase.v from 'explain'@'%'`)
-	tk.MustExec(`flush privileges`)
 
 	err = tk1.ExecToErr("explain select * from v")
 	c.Assert(err.Error(), Equals, plannercore.ErrTableaccessDenied.GenWithStackByArgs("SELECT", "explain", "%", "v").Error())
@@ -116,7 +112,7 @@ func (s *testSuite1) TestExplainAnalyzeMemory(c *C) {
 	s.checkMemoryInfo(c, tk, "explain analyze select * from t order by v")
 	s.checkMemoryInfo(c, tk, "explain analyze select * from t order by v limit 5")
 	s.checkMemoryInfo(c, tk, "explain analyze select /*+ HASH_JOIN(t1, t2) */ t1.k from t t1, t t2 where t1.v = t2.v+1")
-	s.checkMemoryInfo(c, tk, "explain analyze select /*+ SM_JOIN(t1, t2) */ t1.k from t t1, t t2 where t1.k = t2.k+1")
+	s.checkMemoryInfo(c, tk, "explain analyze select /*+ MERGE_JOIN(t1, t2) */ t1.k from t t1, t t2 where t1.k = t2.k+1")
 	s.checkMemoryInfo(c, tk, "explain analyze select /*+ INL_JOIN(t1, t2) */ t1.k from t t1, t t2 where t1.k = t2.k and t1.v=1")
 	s.checkMemoryInfo(c, tk, "explain analyze select /*+ INL_HASH_JOIN(t1, t2) */ t1.k from t t1, t t2 where t1.k = t2.k and t1.v=1")
 	s.checkMemoryInfo(c, tk, "explain analyze select /*+ INL_MERGE_JOIN(t1, t2) */ t1.k from t t1, t t2 where t1.k = t2.k and t1.v=1")
@@ -129,7 +125,7 @@ func (s *testSuite1) TestExplainAnalyzeMemory(c *C) {
 }
 
 func (s *testSuite1) checkMemoryInfo(c *C, tk *testkit.TestKit, sql string) {
-	memCol := 5
+	memCol := 6
 	ops := []string{"Join", "Reader", "Top", "Sort", "LookUp", "Projection", "Selection", "Agg"}
 	rows := tk.MustQuery(sql).Rows()
 	for _, row := range rows {
@@ -137,7 +133,7 @@ func (s *testSuite1) checkMemoryInfo(c *C, tk *testkit.TestKit, sql string) {
 		for i, c := range row {
 			strs[i] = c.(string)
 		}
-		if strings.Contains(strs[2], "cop") {
+		if strings.Contains(strs[3], "cop") {
 			continue
 		}
 
@@ -201,7 +197,7 @@ func (s *testSuite2) TestExplainAnalyzeExecutionInfo(c *C) {
 	s.checkExecutionInfo(c, tk, "explain analyze select * from t order by v")
 	s.checkExecutionInfo(c, tk, "explain analyze select * from t order by v limit 5")
 	s.checkExecutionInfo(c, tk, "explain analyze select /*+ HASH_JOIN(t1, t2) */ t1.k from t t1, t t2 where t1.v = t2.v+1")
-	s.checkExecutionInfo(c, tk, "explain analyze select /*+ SM_JOIN(t1, t2) */ t1.k from t t1, t t2 where t1.k = t2.k+1")
+	s.checkExecutionInfo(c, tk, "explain analyze select /*+ MERGE_JOIN(t1, t2) */ t1.k from t t1, t t2 where t1.k = t2.k+1")
 	s.checkExecutionInfo(c, tk, "explain analyze select /*+ INL_JOIN(t1, t2) */ t1.k from t t1, t t2 where t1.k = t2.k and t1.v=1")
 	s.checkExecutionInfo(c, tk, "explain analyze select /*+ INL_HASH_JOIN(t1, t2) */ t1.k from t t1, t t2 where t1.k = t2.k and t1.v=1")
 	s.checkExecutionInfo(c, tk, "explain analyze select /*+ INL_MERGE_JOIN(t1, t2) */ t1.k from t t1, t t2 where t1.k = t2.k and t1.v=1")
@@ -238,5 +234,27 @@ func (s *testSuite2) checkExecutionInfo(c *C, tk *testkit.TestKit, sql string) {
 		}
 
 		c.Assert(strs[executionInfoCol], Not(Equals), "time:0s, loops:0, rows:0")
+	}
+}
+
+func (s *testSuite2) TestExplainAnalyzeActRowsNotEmpty(c *C) {
+	tk := testkit.NewTestKitWithInit(c, s.store)
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t (a int, b int, index (a))")
+	tk.MustExec("insert into t values (1, 1)")
+
+	s.checkActRowsNotEmpty(c, tk, "explain analyze select * from t t1, t t2 where t1.b = t2.a and t1.b = 2333")
+}
+
+func (s *testSuite2) checkActRowsNotEmpty(c *C, tk *testkit.TestKit, sql string) {
+	actRowsCol := 2
+	rows := tk.MustQuery(sql).Rows()
+	for _, row := range rows {
+		strs := make([]string, len(row))
+		for i, c := range row {
+			strs[i] = c.(string)
+		}
+
+		c.Assert(strs[actRowsCol], Not(Equals), "")
 	}
 }

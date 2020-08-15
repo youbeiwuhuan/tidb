@@ -62,6 +62,11 @@ func (c *Context) Execute(ctx context.Context, sql string) ([]sqlexec.RecordSet,
 	return nil, errors.Errorf("Not Support.")
 }
 
+// ExecuteInternal implements sqlexec.SQLExecutor ExecuteInternal interface.
+func (c *Context) ExecuteInternal(ctx context.Context, sql string) ([]sqlexec.RecordSet, error) {
+	return nil, errors.Errorf("Not Support.")
+}
+
 type mockDDLOwnerChecker struct{}
 
 func (c *mockDDLOwnerChecker) IsOwner() bool { return true }
@@ -169,7 +174,6 @@ func (c *Context) InitTxnWithStartTS(startTS uint64) error {
 		if err != nil {
 			return errors.Trace(err)
 		}
-		txn.SetCap(kv.DefaultTxnMembufCap)
 		c.txn.Transaction = txn
 	}
 	return nil
@@ -204,9 +208,7 @@ func (c *Context) GoCtx() context.Context {
 func (c *Context) StoreQueryFeedback(_ interface{}) {}
 
 // StmtCommit implements the sessionctx.Context interface.
-func (c *Context) StmtCommit(tracker *memory.Tracker) error {
-	return nil
-}
+func (c *Context) StmtCommit() {}
 
 // StmtRollback implements the sessionctx.Context interface.
 func (c *Context) StmtRollback() {
@@ -218,7 +220,7 @@ func (c *Context) StmtGetMutation(tableID int64) *binlog.TableMutation {
 }
 
 // StmtAddDirtyTableOP implements the sessionctx.Context interface.
-func (c *Context) StmtAddDirtyTableOP(op int, tid int64, handle int64) {
+func (c *Context) StmtAddDirtyTableOP(op int, tid int64, handle kv.Handle) {
 }
 
 // AddTableLock implements the sessionctx.Context interface.

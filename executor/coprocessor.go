@@ -20,9 +20,11 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/coprocessor"
 	"github.com/pingcap/kvproto/pkg/tikvpb"
+	"github.com/pingcap/parser/auth"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/planner/core"
+	"github.com/pingcap/tidb/privilege"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
@@ -73,6 +75,9 @@ func (h *CoprocessorDAGHandler) HandleRequest(ctx context.Context, req *coproces
 			return h.buildErrorResponse(err)
 		}
 		totalChunks = append(totalChunks, partChunks...)
+	}
+	if err := e.Close(); err != nil {
+		return h.buildErrorResponse(err)
 	}
 	return h.buildUnaryResponse(totalChunks)
 }
@@ -130,9 +135,26 @@ func (h *CoprocessorDAGHandler) buildDAGExecutor(req *coprocessor.Request) (Exec
 		return nil, errors.Trace(err)
 	}
 
+	if dagReq.User != nil {
+		pm := privilege.GetPrivilegeManager(h.sctx)
+		if pm != nil {
+			h.sctx.GetSessionVars().User = &auth.UserIdentity{
+				Username: dagReq.User.UserName,
+				Hostname: dagReq.User.UserHost,
+			}
+			authName, authHost, success := pm.GetAuthWithoutVerification(dagReq.User.UserName, dagReq.User.UserHost)
+			if success {
+				h.sctx.GetSessionVars().User.AuthUsername = authName
+				h.sctx.GetSessionVars().User.AuthHostname = authHost
+				h.sctx.GetSessionVars().ActiveRoles = pm.GetDefaultRoles(authName, authHost)
+			}
+		}
+	}
+
 	stmtCtx := h.sctx.GetSessionVars().StmtCtx
 	stmtCtx.SetFlagsFromPBFlag(dagReq.Flags)
 	stmtCtx.TimeZone, err = timeutil.ConstructTimeZone(dagReq.TimeZoneName, int(dagReq.TimeZoneOffset))
+	h.sctx.GetSessionVars().TimeZone = stmtCtx.TimeZone
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -165,6 +187,14 @@ func (h *CoprocessorDAGHandler) buildUnaryResponse(chunks []tipb.Chunk) *coproce
 	selResp := tipb.SelectResponse{
 		Chunks:     chunks,
 		EncodeType: h.dagReq.EncodeType,
+	}
+	if h.dagReq.CollectExecutionSummaries != nil && *h.dagReq.CollectExecutionSummaries {
+		execSummary := make([]*tipb.ExecutorExecutionSummary, len(h.dagReq.Executors))
+		for i := range execSummary {
+			// TODO: Add real executor execution summary information.
+			execSummary[i] = &tipb.ExecutorExecutionSummary{}
+		}
+		selResp.ExecutionSummaries = execSummary
 	}
 	data, err := proto.Marshal(&selResp)
 	if err != nil {

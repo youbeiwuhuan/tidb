@@ -14,48 +14,20 @@
 package chunk
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
-	"path/filepath"
 	"sync"
 
-	"github.com/pingcap/log"
 	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/checksum"
 	"github.com/pingcap/tidb/util/disk"
 	"github.com/pingcap/tidb/util/stringutil"
-	"go.uber.org/zap"
 )
-
-const (
-	writeBufSize = 128 * 1024
-	readBufSize  = 4 * 1024
-)
-
-var bufWriterPool = sync.Pool{
-	New: func() interface{} { return bufio.NewWriterSize(nil, writeBufSize) },
-}
-
-var bufReaderPool = sync.Pool{
-	New: func() interface{} { return bufio.NewReaderSize(nil, readBufSize) },
-}
-
-var tmpDir = filepath.Join(os.TempDir(), "tidb-server-"+filepath.Base(os.Args[0]))
-
-func init() {
-	err := os.RemoveAll(tmpDir) // clean the uncleared temp file during the last run.
-	if err != nil {
-		log.Warn("Remove temporary file error", zap.String("tmpDir", tmpDir), zap.Error(err))
-	}
-	err = os.Mkdir(tmpDir, 0755)
-	if err != nil {
-		log.Warn("Mkdir temporary file error", zap.String("tmpDir", tmpDir), zap.Error(err))
-	}
-}
 
 // ListInDisk represents a slice of chunks storing in temporary disk.
 type ListInDisk struct {
@@ -67,7 +39,8 @@ type ListInDisk struct {
 	offWrite int64
 
 	disk          *os.File
-	bufWriter     *bufio.Writer
+	w             io.WriteCloser
+	bufFlushMutex sync.RWMutex
 	diskTracker   *disk.Tracker // track disk usage.
 	numRowsInDisk int
 }
@@ -85,12 +58,12 @@ func NewListInDisk(fieldTypes []*types.FieldType) *ListInDisk {
 }
 
 func (l *ListInDisk) initDiskFile() (err error) {
-	l.disk, err = ioutil.TempFile(tmpDir, l.diskTracker.Label().String())
+	l.disk, err = ioutil.TempFile(config.GetGlobalConfig().TempStoragePath, l.diskTracker.Label().String())
 	if err != nil {
 		return
 	}
-	l.bufWriter = bufWriterPool.Get().(*bufio.Writer)
-	l.bufWriter.Reset(l.disk)
+	l.w = checksum.NewWriter(l.disk)
+	l.bufFlushMutex = sync.RWMutex{}
 	return
 }
 
@@ -105,15 +78,36 @@ func (l *ListInDisk) GetDiskTracker() *disk.Tracker {
 }
 
 // flush empties the write buffer, please call flush before read!
-func (l *ListInDisk) flush() error {
-	if l.bufWriter.Buffered() != 0 {
-		return l.bufWriter.Flush()
+func (l *ListInDisk) flush() (err error) {
+	// buffered is not zero only after Add and before GetRow, after the first flush, buffered will always be zero,
+	// hence we use a RWLock to allow quicker quit.
+	l.bufFlushMutex.RLock()
+	checksumWriter := l.w
+	l.bufFlushMutex.RUnlock()
+	if checksumWriter == nil {
+		return nil
 	}
-	return nil
+	l.bufFlushMutex.Lock()
+	defer l.bufFlushMutex.Unlock()
+	if l.w != nil {
+		err = l.w.Close()
+		if err != nil {
+			return
+		}
+		l.w = nil
+		// the l.disk is the underlying object of the l.w, it will be closed
+		// after calling l.w.Close, we need to reopen it before reading rows.
+		l.disk, err = os.Open(l.disk.Name())
+		if err != nil {
+			return
+		}
+	}
+	return
 }
 
 // Add adds a chunk to the ListInDisk. Caller must make sure the input chk
 // is not empty and not used any more and has the same field types.
+// Warning: do not mix Add and GetRow (always use GetRow after you have added all the chunks), and do not use Add concurrently.
 func (l *ListInDisk) Add(chk *Chunk) (err error) {
 	if chk.NumRows() == 0 {
 		return errors.New("chunk appended to List should have at least 1 row")
@@ -125,7 +119,7 @@ func (l *ListInDisk) Add(chk *Chunk) (err error) {
 		}
 	}
 	chk2 := chunkInDisk{Chunk: chk, offWrite: l.offWrite}
-	n, err := chk2.WriteTo(l.bufWriter)
+	n, err := chk2.WriteTo(l.w)
 	l.offWrite += n
 	if err != nil {
 		return
@@ -136,6 +130,20 @@ func (l *ListInDisk) Add(chk *Chunk) (err error) {
 	return
 }
 
+// GetChunk gets a Chunk from the ListInDisk by chkIdx.
+func (l *ListInDisk) GetChunk(chkIdx int) (*Chunk, error) {
+	chk := NewChunkWithCapacity(l.fieldTypes, l.NumRowsOfChunk(chkIdx))
+	offsets := l.offsets[chkIdx]
+	for rowIdx := range offsets {
+		row, err := l.GetRow(RowPtr{ChkIdx: uint32(chkIdx), RowIdx: uint32(rowIdx)})
+		if err != nil {
+			return chk, err
+		}
+		chk.AppendRow(row)
+	}
+	return chk, nil
+}
+
 // GetRow gets a Row from the ListInDisk by RowPtr.
 func (l *ListInDisk) GetRow(ptr RowPtr) (row Row, err error) {
 	err = l.flush()
@@ -143,13 +151,9 @@ func (l *ListInDisk) GetRow(ptr RowPtr) (row Row, err error) {
 		return
 	}
 	off := l.offsets[ptr.ChkIdx][ptr.RowIdx]
-	r := io.NewSectionReader(l.disk, off, l.offWrite-off)
-	bufReader := bufReaderPool.Get().(*bufio.Reader)
-	bufReader.Reset(r)
-	defer bufReaderPool.Put(bufReader)
-
+	r := io.NewSectionReader(checksum.NewReader(l.disk), off, l.offWrite-off)
 	format := rowInDisk{numCol: len(l.fieldTypes)}
-	_, err = format.ReadFrom(bufReader)
+	_, err = format.ReadFrom(r)
 	if err != nil {
 		return row, err
 	}
@@ -172,7 +176,6 @@ func (l *ListInDisk) Close() error {
 	if l.disk != nil {
 		l.diskTracker.Consume(-l.diskTracker.BytesConsumed())
 		terror.Call(l.disk.Close)
-		bufWriterPool.Put(l.bufWriter)
 		return os.Remove(l.disk.Name())
 	}
 	return nil
